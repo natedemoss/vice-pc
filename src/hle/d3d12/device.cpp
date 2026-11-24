@@ -427,10 +427,30 @@ void STDMETHODCALLTYPE Device_CreateSRV(ID3D12Device* self, ID3D12Resource* r, c
         t.RaytracingAccelerationStructure.Location = gm_translate(GM_GPU_VA, t.RaytracingAccelerationStructure.Location);
         d = &t;
     }
-    // A null view needs a description with a known dimension on PC.
-    if (!r && (!d || d->ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN ||
-               d->ViewDimension > D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE))
-        return;
+    // Null views: write a canonical PC null descriptor of the same dimension. Xbox null
+    // descriptions (unknown formats, odd fields) are invalid on PC and remove the device.
+    D3D12_SHADER_RESOURCE_VIEW_DESC nd{};
+    if (!r) {
+        if (!d || d->ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN ||
+            d->ViewDimension >= D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE)
+            return;
+        nd.ViewDimension = d->ViewDimension;
+        nd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nd.Format = nd.ViewDimension == D3D12_SRV_DIMENSION_BUFFER ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
+        switch (nd.ViewDimension) {
+            case D3D12_SRV_DIMENSION_TEXTURE1D: nd.Texture1D.MipLevels = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE1DARRAY: nd.Texture1DArray.MipLevels = 1; nd.Texture1DArray.ArraySize = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE2D: nd.Texture2D.MipLevels = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DARRAY: nd.Texture2DArray.MipLevels = 1; nd.Texture2DArray.ArraySize = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DMS: break;
+            case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY: nd.Texture2DMSArray.ArraySize = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURE3D: nd.Texture3D.MipLevels = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURECUBE: nd.TextureCube.MipLevels = 1; break;
+            case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY: nd.TextureCubeArray.MipLevels = 1; nd.TextureCubeArray.NumCubes = 1; break;
+            default: break;
+        }
+        d = &nd;
+    }
     if (d && d->ViewDimension > D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) return;
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
@@ -443,6 +463,21 @@ void STDMETHODCALLTYPE Device_CreateUAV(ID3D12Device* self, ID3D12Resource* r, I
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*,
                                         const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
     if (!resource_allows(r, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, "CreateUAV")) return;
+    // Null UAVs: canonical PC null descriptor (Xbox null descriptions remove the device).
+    D3D12_UNORDERED_ACCESS_VIEW_DESC nu{};
+    if (!r) {
+        counter = nullptr;
+        if (!d || d->ViewDimension == D3D12_UAV_DIMENSION_UNKNOWN || d->ViewDimension > D3D12_UAV_DIMENSION_TEXTURE3D) {
+            nu.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+        } else {
+            nu.ViewDimension = d->ViewDimension;
+        }
+        nu.Format = nu.ViewDimension == D3D12_UAV_DIMENSION_BUFFER ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (nu.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2DARRAY) nu.Texture2DArray.ArraySize = 1;
+        if (nu.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE1DARRAY) nu.Texture1DArray.ArraySize = 1;
+        if (nu.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE3D) nu.Texture3D.WSize = 1;
+        d = &nu;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
     orig<Fn>(self, 19)(self, r, counter, d, dst);
@@ -454,6 +489,12 @@ void STDMETHODCALLTYPE Device_CreateRTV(ID3D12Device* self, ID3D12Resource* r, c
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*,
                                         D3D12_CPU_DESCRIPTOR_HANDLE);
     if (!resource_allows(r, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, "CreateRTV")) return;
+    D3D12_RENDER_TARGET_VIEW_DESC nr{};
+    if (!r) {  // canonical PC null RTV
+        nr.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nr.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        d = &nr;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
     orig<Fn>(self, 20)(self, r, d, dst);
@@ -465,6 +506,12 @@ void STDMETHODCALLTYPE Device_CreateDSV(ID3D12Device* self, ID3D12Resource* r, c
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*,
                                         D3D12_CPU_DESCRIPTOR_HANDLE);
     if (!resource_allows(r, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, "CreateDSV")) return;
+    D3D12_DEPTH_STENCIL_VIEW_DESC ndv{};
+    if (!r) {  // canonical PC null DSV
+        ndv.Format = DXGI_FORMAT_D32_FLOAT;
+        ndv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+        d = &ndv;
+    }
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
     orig<Fn>(self, 21)(self, r, d, dst);

@@ -16,6 +16,7 @@
 #include <intrin.h>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <map>
 #include <mutex>
@@ -71,6 +72,55 @@ void __cdecl XErrorReport_hle(HRESULT hr, const char* message) {
 std::mutex g_mu;
 std::map<std::string, void*>& g_objects = *new std::map<std::string, void*>();
 
+// ---- networking (interface {BF2346B2-...}) --------------------------------------------
+// Layout matches the GDK's XNetworkingConnectivityHint: level, cost, interface type,
+// then networkInitialized at +0xC (the title's callback checks exactly that byte).
+struct ConnectivityHint {
+    uint32_t level;          // 1 = none (offline)
+    uint32_t cost;           // 0 = unknown
+    uint32_t iana_type;
+    uint8_t initialized;     // +0xC
+    uint8_t approaching_limit, over_limit, roaming;
+};
+
+void fill_hint(ConnectivityHint* h) {
+    memset(h, 0, sizeof(*h));
+    h->level = 1;  // XNetworkingConnectivityLevelHint::None: initialised, no network (offline play)
+    h->initialized = 1;
+}
+
+// slot 15: XNetworkingGetConnectivityHint(hint*)  (game+0x55e0e78)
+HRESULT STDMETHODCALLTYPE Net_GetConnectivityHint(ProbeObject*, ConnectivityHint* hint) {
+    if (!hint) return E_POINTER;
+    fill_hint(hint);
+    LOG("[xgr] XNetworkingGetConnectivityHint -> initialised, offline");
+    return S_OK;
+}
+
+using HintCallback = void(__cdecl*)(void* context, const ConnectivityHint* hint);
+
+// slot 16: XNetworkingRegisterConnectivityHintChanged(queue, context, callback, token*)
+// (game+0x55e0f0c). The title waits on an event its callback sets once the network is
+// initialised, so the callback runs right away with an "initialised, offline" hint.
+HRESULT STDMETHODCALLTYPE Net_RegisterConnectivityHintChanged(ProbeObject*, void* queue, void* context,
+                                                              HintCallback cb, uint64_t* token) {
+    if (token) *token = 1;
+    ConnectivityHint h;
+    fill_hint(&h);
+    LOG("[xgr] XNetworkingRegisterConnectivityHintChanged(queue %p, context %p, callback %p) -> notified (offline)",
+        queue, context, cb);
+    if (cb) cb(context, &h);
+    return S_OK;
+}
+
+void install_known_overrides(ProbeType* t, const GUID* iface) {
+    if (iface && iface->Data1 == 0xBF2346B2) {
+        probe_override(t, 15, reinterpret_cast<void*>(&Net_GetConnectivityHint), "XNetworkingGetConnectivityHint");
+        probe_override(t, 16, reinterpret_cast<void*>(&Net_RegisterConnectivityHintChanged),
+                       "XNetworkingRegisterConnectivityHintChanged");
+    }
+}
+
 HRESULT __cdecl QueryApiImpl_hle(const GUID* provider, const GUID* iface, void** out) {
     if (!out) return E_POINTER;
     std::string key = guid_str(provider) + "/" + guid_str(iface);
@@ -78,7 +128,9 @@ HRESULT __cdecl QueryApiImpl_hle(const GUID* provider, const GUID* iface, void**
     auto it = g_objects.find(key);
     if (it == g_objects.end()) {
         std::string name = "XGR" + guid_str(iface).substr(1, 8);
-        void* obj = probe_create(probe_type(_strdup(name.c_str())));
+        ProbeType* type = probe_type(_strdup(name.c_str()));
+        install_known_overrides(type, iface);
+        void* obj = probe_create(type);
         it = g_objects.emplace(key, obj).first;
         LOG("[xgr] QueryApiImpl(provider %s, interface %s) -> probe %s", guid_str(provider).c_str(),
             guid_str(iface).c_str(), name.c_str());
