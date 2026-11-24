@@ -427,6 +427,11 @@ void STDMETHODCALLTYPE Device_CreateSRV(ID3D12Device* self, ID3D12Resource* r, c
         t.RaytracingAccelerationStructure.Location = gm_translate(GM_GPU_VA, t.RaytracingAccelerationStructure.Location);
         d = &t;
     }
+    // A null view needs a description with a known dimension on PC.
+    if (!r && (!d || d->ViewDimension == D3D12_SRV_DIMENSION_UNKNOWN ||
+               d->ViewDimension > D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE))
+        return;
+    if (d && d->ViewDimension > D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE) return;
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
     orig<Fn>(self, 18)(self, r, d, dst);

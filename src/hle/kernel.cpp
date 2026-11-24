@@ -15,6 +15,10 @@
 #include <cwchar>
 #include <string>
 
+HMODULE xgr_fake_module(const wchar_t* name);
+bool xgr_is_fake(HMODULE m);
+FARPROC xgr_proc(const char* name);
+
 namespace {
 
 std::atomic<int> g_ok_logged{0};
@@ -93,9 +97,20 @@ DWORD WINAPI GetModuleFileNameA_hle(HMODULE m, LPSTR buf, DWORD size) {
 }
 
 HMODULE WINAPI LoadLibraryExW_hle(LPCWSTR name, HANDLE file, DWORD flags) {
+    if (HMODULE fake = xgr_fake_module(name)) return fake;
     HMODULE m = LoadLibraryExW(name, file, flags);
     LOG("[ldr] LoadLibraryExW(\"%ls\", 0x%lx) -> %p%s", name ? name : L"(null)", flags, m, m ? "" : " FAILED");
     return m;
+}
+
+FARPROC WINAPI GetProcAddress_hle(HMODULE m, LPCSTR name) {
+    if (xgr_is_fake(m)) return xgr_proc(name);
+    return GetProcAddress(m, name);
+}
+
+BOOL WINAPI FreeLibrary_hle(HMODULE m) {
+    if (xgr_is_fake(m)) return TRUE;
+    return FreeLibrary(m);
 }
 
 HMODULE WINAPI LoadLibraryExA_hle(LPCSTR name, HANDLE file, DWORD flags) {
@@ -162,6 +177,8 @@ const HleExport kExports[] = {
     {"api-ms-win-core-libraryloader-l1-2-0.dll", "GetModuleFileNameA", FN(&GetModuleFileNameA_hle)},
     {"api-ms-win-core-libraryloader-l1-2-0.dll", "LoadLibraryExW", FN(&LoadLibraryExW_hle)},
     {"api-ms-win-core-libraryloader-l1-2-0.dll", "LoadLibraryExA", FN(&LoadLibraryExA_hle)},
+    {"api-ms-win-core-libraryloader-l1-2-0.dll", "GetProcAddress", FN(&GetProcAddress_hle)},
+    {"api-ms-win-core-libraryloader-l1-2-0.dll", "FreeLibrary", FN(&FreeLibrary_hle)},
     {"api-ms-win-core-file-l1-1-0.dll", "CreateFileW", FN(&CreateFileW_hle)},
     {"api-ms-win-core-file-l1-1-0.dll", "GetFileAttributesW", FN(&GetFileAttributesW_hle)},
     {"api-ms-win-core-file-l1-1-0.dll", "GetFileAttributesA", FN(&GetFileAttributesA_hle)},

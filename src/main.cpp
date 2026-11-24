@@ -377,6 +377,31 @@ int wmain(int argc, wchar_t** argv) {
     AddVectoredExceptionHandler(1, vectored_handler);
     SetUnhandledExceptionFilter(unhandled_filter);
     SetCurrentDirectoryW(root.c_str());
+    {
+        // VICEPC_SAMPLE=1: every 3 s, pause the main (title) thread and log where it is.
+        char sv[4] = "";
+        if (GetEnvironmentVariableA("VICEPC_SAMPLE", sv, sizeof(sv)) && sv[0] == '1') {
+            HANDLE self = nullptr;
+            DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self,
+                            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, 0);
+            CloseHandle(CreateThread(nullptr, 0, [](void* h) -> DWORD {
+                for (int i = 0; i < 40; ++i) {
+                    Sleep(3000);
+                    HANDLE t = static_cast<HANDLE>(h);
+                    if (SuspendThread(t) == (DWORD)-1) break;
+                    CONTEXT ctx{};
+                    ctx.ContextFlags = CONTEXT_FULL;
+                    if (GetThreadContext(t, &ctx)) {
+                        LOG("[sample] main thread #%d", i);
+                        print_backtrace(ctx);
+                    }
+                    ResumeThread(t);
+                    log_flush();
+                }
+                return 0;
+            }, self, 0, nullptr));
+        }
+    }
 
     LOG("[run] TLS callbacks (process attach)");
     tls_run_process_attach();
