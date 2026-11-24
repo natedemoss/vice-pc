@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -160,6 +161,14 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandList(ID3D12Device* self, UINT mask
                                                    void** out) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_COMMAND_LIST_TYPE, ID3D12CommandAllocator*,
                                            ID3D12PipelineState*, REFIID, void**);
+    // Title command lists are packet buffers the title writes into directly (see cmdlist.cpp).
+    // Set VICEPC_REAL_LISTS=1 to hand out real PC lists instead (diagnostics only).
+    char real[4] = "";
+    if (!(GetEnvironmentVariableA("VICEPC_REAL_LISTS", real, sizeof(real)) && real[0] == '1')) {
+        (void)alloc; (void)pso; (void)mask;
+        *out = cmdlist_create_title_list(type);
+        return *out ? S_OK : E_OUTOFMEMORY;
+    }
     HRESULT hr = orig<Fn>(self, 12)(self, mask, type, alloc, pso, __uuidof(ID3D12GraphicsCommandList), out);
     if (should_log(hr)) LOG("[d3d12] CreateCommandList(type=%d) -> 0x%08lx", type, hr);
     if (SUCCEEDED(hr)) {
@@ -643,12 +652,62 @@ HRESULT STDMETHODCALLTYPE Device_CreatePlacedResource(ID3D12Device* self, ID3D12
     return hr;
 }
 
+// Xbox ID3D12Fence slot 12: pointer to the fence's completed value, which the title reads
+// directly (game+0x4fb0aef; compares it with UINT64_MAX for device loss). PC fences only
+// have GetCompletedValue(), so each fence gets a cell that a host thread keeps current.
+struct FenceCell {
+    ID3D12Fence* fence;
+    volatile UINT64 value;
+};
+std::mutex g_fence_mu;
+std::vector<FenceCell*>& g_fence_cells = *new std::vector<FenceCell*>();
+std::unordered_map<ID3D12Fence*, FenceCell*>& g_fence_by_obj = *new std::unordered_map<ID3D12Fence*, FenceCell*>();
+
+UINT64 fence_completed(ID3D12Fence* f) {
+    return orig<UINT64(STDMETHODCALLTYPE*)(ID3D12Fence*)>(f, 8)(f);
+}
+
+DWORD WINAPI fence_updater(void*) {
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_fence_mu);
+            for (FenceCell* c : g_fence_cells) c->value = fence_completed(c->fence);
+        }
+        Sleep(1);
+    }
+}
+
+const volatile UINT64* STDMETHODCALLTYPE Fence_GetCompletedValueAddressX(ID3D12Fence* self) {
+    std::lock_guard<std::mutex> lk(g_fence_mu);
+    auto it = g_fence_by_obj.find(self);
+    FenceCell* c;
+    if (it != g_fence_by_obj.end()) {
+        c = it->second;
+    } else {
+        c = new FenceCell{self, 0};
+        self->AddRef();  // the cell keeps the fence alive
+        g_fence_by_obj[self] = c;
+        g_fence_cells.push_back(c);
+        static bool started = false;
+        if (!started) {
+            started = true;
+            CloseHandle(CreateThread(nullptr, 0, fence_updater, nullptr, 0, nullptr));
+            LOG("[d3d12] fence value mirror thread started");
+        }
+    }
+    c->value = fence_completed(self);
+    return &c->value;
+}
+
 HRESULT STDMETHODCALLTYPE Device_CreateFence(ID3D12Device* self, UINT64 initial, D3D12_FENCE_FLAGS flags, REFIID,
                                              void** out) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT64, D3D12_FENCE_FLAGS, REFIID, void**);
     HRESULT hr = orig<Fn>(self, 36)(self, initial, flags, __uuidof(ID3D12Fence), out);
     if (should_log(hr)) LOG("[d3d12] CreateFence(%llu, flags=0x%x) -> 0x%08lx", (unsigned long long)initial, flags, hr);
-    if (SUCCEEDED(hr)) vt_patch(*out, kVtFence);
+    if (SUCCEEDED(hr)) {
+        vt_patch(*out, kVtFence);
+        vt_override(*out, 12, reinterpret_cast<void*>(&Fence_GetCompletedValueAddressX));
+    }
     return hr;
 }
 
@@ -830,6 +889,54 @@ HRESULT STDMETHODCALLTYPE Device_CreatePipelineStateX3(ID3D12Device* self, const
     return Device_CreatePipelineStateX(self, desc, 0, 0, riid, out);
 }
 
+// Device slot 25: GetResourceAllocationInfo. The title calls it C-style (hidden return
+// first, game+0x34413f) with Xbox resource descs (Xbox flags, tiled layouts) that PC
+// rejects, returning alignment 0 (the title later divides by it). Detect the argument
+// order by which register holds the device, sanitise the descs and call the PC method.
+void sanitize_desc(D3D12_RESOURCE_DESC& d) {
+    d.Flags &= static_cast<D3D12_RESOURCE_FLAGS>(0x3F);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        d.Format = DXGI_FORMAT_UNKNOWN;
+        d.Height = 1; d.DepthOrArraySize = 1; d.MipLevels = 1;
+        d.SampleDesc = {1, 0};
+    } else {
+        d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (d.SampleDesc.Count == 0) d.SampleDesc = {1, 0};
+    }
+    if (d.Alignment != 0 && d.Alignment != 4096 && d.Alignment != 65536 && d.Alignment != 4194304) d.Alignment = 0;
+}
+
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Device_GetResourceAllocationInfo(void* a1, void* a2, UINT mask,
+                                                                                   UINT n,
+                                                                                   const D3D12_RESOURCE_DESC* descs) {
+    ID3D12Device* self;
+    D3D12_RESOURCE_ALLOCATION_INFO* ret;
+    if (a1 == g_device) { self = static_cast<ID3D12Device*>(a1); ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a2); }
+    else { self = static_cast<ID3D12Device*>(a2); ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1); }
+    using Fn = D3D12_RESOURCE_ALLOCATION_INFO*(STDMETHODCALLTYPE*)(ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT,
+                                                                    UINT, const D3D12_RESOURCE_DESC*);
+    D3D12_RESOURCE_DESC local[16];
+    UINT m = n < 16 ? n : 16;
+    for (UINT i = 0; i < m; ++i) { local[i] = descs[i]; sanitize_desc(local[i]); }
+    orig<Fn>(self, 25)(self, ret, mask, m, local);
+    if (ret->SizeInBytes == UINT64_MAX) {
+        for (UINT i = 0; i < m; ++i) local[i].Alignment = 0;
+        orig<Fn>(self, 25)(self, ret, mask, m, local);
+    }
+    if (ret->Alignment == 0 || ret->SizeInBytes == UINT64_MAX) {
+        static std::atomic<int> bad{0};
+        if (bad.fetch_add(1) < 10)
+            LOG("[d3d12] GetResourceAllocationInfo rejected desc (dim=%d %llux%u fmt=%d flags=0x%x): using a safe estimate",
+                descs[0].Dimension, (unsigned long long)descs[0].Width, descs[0].Height, descs[0].Format, descs[0].Flags);
+        UINT64 w = descs[0].Width ? descs[0].Width : 1;
+        UINT64 size = descs[0].Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? w : w * (descs[0].Height ? descs[0].Height : 1) * 16;
+        ret->Alignment = 65536;
+        ret->SizeInBytes = (size + 65535) & ~UINT64(65535);
+    }
+    return ret;
+}
+
 HRESULT STDMETHODCALLTYPE Device_CheckFeatureSupport(ID3D12Device* self, D3D12_FEATURE f, void* data, UINT size) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, D3D12_FEATURE, void*, UINT);
     HRESULT hr = orig<Fn>(self, 13)(self, f, data, size);
@@ -919,6 +1026,7 @@ HRESULT d3d12_create_title_device(void** out) {
     OV(67, Device_CreatePipelineStateX3);
     OV(70, Device_CreateSRVAtAddressX);    // Xbox: buffer SRV from a GPU VA
     OV(133, Device_CreateResourceAtAddressX);  // Xbox: resource at a title-chosen GPU VA
+    OV(25, Device_GetResourceAllocationInfo);
     OV(17, Device_CreateCBV);
     OV(18, Device_CreateSRV);
     OV(19, Device_CreateUAV);

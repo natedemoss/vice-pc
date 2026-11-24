@@ -25,6 +25,7 @@ add_executable(vice-pc
   src/hle/xcrdapi.cpp
   src/hle/xg_xs.cpp
   src/hle/crt.cpp
+  src/hle/acphal.cpp
   src/hle/kernel.cpp
   src/hle/d3d12/vtpatch.cpp
   src/hle/d3d12/device.cpp

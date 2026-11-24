@@ -5,6 +5,13 @@
 #include "gpumem.h"
 #include "vtpatch.h"
 
+#include "../../log.h"
+#include "../../stubs.h"
+
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+
 #include <windows.h>
 #include <d3d12.h>
 
@@ -90,7 +97,104 @@ void STDMETHODCALLTYPE ClearUAV(List* self, D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12
 
 }  // namespace
 
+// ---- title-owned command lists ---------------------------------------------------
+//
+// Xbox command lists are user-mode GPU packet buffers: the title's inlined fast paths
+// write packets at [list+0x18] (cursor) up to [list+0x30] (limit) and poke state fields
+// in the object (e.g. +0x140, +0x544). On a PC list object that corrupts the driver.
+// Until packets are decoded, every title command list is a title-owned object: a large
+// zeroed body plus a packet buffer, with no-op methods. When the buffer fills, the title
+// calls slot 25 to get space; the cursor is rewound (packets are discarded).
+
+namespace {
+
+constexpr size_t kFakeBody = 1 << 20;     // object body (title writes fields well past 0x500)
+constexpr size_t kFakePackets = 1 << 20;  // packet buffer
+constexpr size_t kFakeSlack = 64 << 10;   // headroom past the limit for one packet burst
+
+struct FakeList {
+    void** vtbl;
+};
+
+uint8_t* fake_buf(FakeList* l) { return *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(l) + 0x10); }
+void fake_rewind(FakeList* l) {
+    auto* o = reinterpret_cast<uint8_t*>(l);
+    uint8_t* b = fake_buf(l);
+    *reinterpret_cast<uint8_t**>(o + 0x18) = b;
+    *reinterpret_cast<uint8_t**>(o + 0x30) = b + kFakePackets - kFakeSlack;
+}
+
+std::atomic<uint64_t> g_fake_rewinds{0};
+
+HRESULT STDMETHODCALLTYPE Fake_QueryInterface(FakeList* self, REFIID, void** out) {
+    *out = self;
+    return S_OK;
+}
+ULONG STDMETHODCALLTYPE Fake_AddRef(FakeList*) { return 2; }
+ULONG STDMETHODCALLTYPE Fake_Release(FakeList*) { return 1; }  // never freed: the title may hold stale pointers
+HRESULT STDMETHODCALLTYPE Fake_Close(FakeList*) { return S_OK; }
+HRESULT STDMETHODCALLTYPE Fake_Reset(FakeList* self, void*, void*) {
+    fake_rewind(self);
+    return S_OK;
+}
+void STDMETHODCALLTYPE Fake_MakeSpace(FakeList* self) {
+    uint64_t n = g_fake_rewinds.fetch_add(1) + 1;
+    if ((n & (n - 1)) == 0) LOG("[d3d12] title command lists: %llu packet buffers filled (discarded: packets not decoded yet)",
+                                (unsigned long long)n);
+    fake_rewind(self);
+}
+
+void** fake_vtable() {
+    static void** vt = [] {
+        constexpr int kSlots = 256;
+        void** t = new void*[kSlots];
+        for (int i = 0; i < kSlots; ++i) {
+            char name[48];
+            snprintf(name, sizeof(name), "slot%d", i);
+            t[i] = stub_create("XboxCommandList", _strdup(name), stub_stop_mode());
+        }
+        t[0] = reinterpret_cast<void*>(&Fake_QueryInterface);
+        t[1] = reinterpret_cast<void*>(&Fake_AddRef);
+        t[2] = reinterpret_cast<void*>(&Fake_Release);
+        t[8] = reinterpret_cast<void*>(&Fake_Close);
+        t[9] = reinterpret_cast<void*>(&Fake_Reset);
+        t[25] = reinterpret_cast<void*>(&Fake_MakeSpace);
+        return t;
+    }();
+    return vt;
+}
+
+}  // namespace
+
+void* cmdlist_create_title_list(int type) {
+    auto* o = static_cast<uint8_t*>(VirtualAlloc(nullptr, kFakeBody + kFakePackets, MEM_RESERVE | MEM_COMMIT,
+                                                 PAGE_READWRITE));
+    if (!o) return nullptr;
+    auto* l = reinterpret_cast<FakeList*>(o);
+    l->vtbl = fake_vtable();
+    *reinterpret_cast<uint8_t**>(o + 0x10) = o + kFakeBody;
+    fake_rewind(l);
+    static std::atomic<int> n{0};
+    int k = n.fetch_add(1);
+    if (k < 4 || (k & (k - 1)) == 0) LOG("[d3d12] title command list #%d (type %d) at %p: packets kept in title memory", k + 1, type, o);
+    return l;
+}
+
 void cmdlist_install(void* list) {
+    // Only the base ID3D12GraphicsCommandList methods (slots 0-58) keep PC's meaning on
+    // Xbox. Extension slots differ (title calls slot 75 with a bool; PC slot 75 is
+    // DispatchRays(desc*)), so they become logged no-ops until each is identified.
+    static bool stubbed = false;
+    for (int s = 59; s < 79; ++s) {
+        static void* stubs[79] = {};
+        if (!stubbed) {
+            char name[48];
+            snprintf(name, sizeof(name), "slot%d (Xbox-only)", s);
+            stubs[s] = stub_create("ID3D12GraphicsCommandList", _strdup(name), stub_stop_mode());
+        }
+        vt_override(list, s, stubs[s]);
+    }
+    stubbed = true;
 #define OV(slot, fn) vt_override(list, slot, reinterpret_cast<void*>(&fn))
     OV(30, SetRootTable<30>);
     OV(31, SetRootTable<31>);
