@@ -8,6 +8,7 @@
 #include "tls.h"
 
 #include <windows.h>
+#include <intrin.h>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -111,7 +112,8 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
     if (reported.fetch_add(1) < 20) {
         void* addr = ep->ExceptionRecord->ExceptionAddress;
         if (g_img.contains(addr)) {
-            LOG("[exception] 0x%08lx at game+0x%llx (first chance)", code, (unsigned long long)g_img.rva_of(addr));
+            LOG("[exception] 0x%08lx at game+0x%llx (first chance, thread %lu, tls[0]=%p)", code, (unsigned long long)g_img.rva_of(addr), GetCurrentThreadId(), reinterpret_cast<void**>(__readgsqword(0x58))[0]);
+            LOG("            dr0=%llx dr7=%llx", (unsigned long long)ep->ContextRecord->Dr0, (unsigned long long)ep->ContextRecord->Dr7);
         } else {
             LOG("[exception] 0x%08lx at 0x%p (first chance)", code, addr);
         }

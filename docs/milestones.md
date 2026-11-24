@@ -41,7 +41,18 @@ Each run of `--stop-on-stub` gets further. Stops so far, in order:
 | 12 | `QueryInterface(IDXGIDevice)` → `GetAdapter` → `EnumOutputs(0)` | DXGI device stand-in returning the real adapter (by LUID) |
 | 13 | `VirtualFree(MEM_PRESERVE_PLACEHOLDER)` fails | `XMemVirtualAlloc` keeps placeholder flags via `VirtualAlloc2`. 185 MB split + 2,960 physical pages mapped |
 | 14 | Crash in D3D12Core from `GetCPUDescriptorHandleForHeapStart` | **Calling convention:** title uses the C interface, so 8-byte struct returns come back in RAX |
-| 15 | **Descriptor handle assert, then a crash in the GPU driver writing a descriptor** | **Current wall** (see below) |
+| 15 | Descriptor handle assert, then a crash in the GPU driver writing a descriptor | Xbox heap desc carries a title-chosen CPU address: heap start reported at that address, every handle translated (`src/hle/d3d12/gpumem.*`) |
+| 16 | Device slot 133: buffer at a title-chosen GPU address (174 MB) | Real buffer + GPU-VA translation table; `GetGPUVirtualAddress` reports the title's address |
+| 17 | Device slot 70: SRV made straight from a GPU address | View built on the resource that backs that address |
+| 18 | `d3d12_xs!D3D12SerializeVersionedRootSignature` | Forwarded to PC D3D12 |
+| 19 | `xg_xs` texture layout library | Linear-layout stand-ins (`XGSuggestSwizzleMode`, texture computer) |
+| 20 | DirectStorage queue waits forever | Real file objects, queue, status array; requests served from the `.rpf` files |
+| 21 | Compressed streaming blocks (`78 DA`) | Built-in zlib/deflate decoder (`src/inflate.cpp`, unit-tested) |
+| 22 | Fail-fast (0xC0000409) with no handler output | `--trace-d3d` found it: Xbox device slots 44+ differ from PC, forwarding them kills the runtime. Now stubs; slot 62 (console pipeline blob) fails cleanly |
+| 23 | Init skipped: `CreateCommandSignature` rejected (mesh dispatch) | Falls back to compute dispatch on GPUs without mesh shaders |
+| 24 | Texture objects corrupted | Hardware watchpoint caught it: the title calls some struct-returning methods C++-style and others C-style. Thunk now detects which per call |
+| 25 | Null frame context | Stack corruption: Xbox queue slot 18 is `GetTimestampFrequency`, PC slot 18 is `GetDesc` (16 bytes into an 8-byte variable) |
+| 26 | **Main loop starting: render targets (2560×1440), hundreds of textures, worker threads running; next crash in render setup** | **Current** |
 
 ### Why D3D12 works at all
 

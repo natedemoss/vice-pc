@@ -79,6 +79,14 @@ HRESULT STDMETHODCALLTYPE Device_QueryInterface(ID3D12Device* self, REFIID riid,
 
 // ---- object creation ----------------------------------------------------------
 
+// Xbox ID3D12CommandQueue slot 18: GetTimestampFrequency(UINT64*) (game+0x24841a6 uses the
+// result as ticks per second). On PC slot 18 is GetDesc, which writes 16 bytes into the
+// title's 8-byte variable and corrupts its stack, so forward to PC slot 16 instead.
+HRESULT STDMETHODCALLTYPE Queue_GetTimestampFrequencyX(ID3D12CommandQueue* self, UINT64* freq) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT64*);
+    return orig<Fn>(self, 16)(self, freq);
+}
+
 HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3D12_COMMAND_QUEUE_DESC* desc,
                                                     REFIID, void** out) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
@@ -89,7 +97,10 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3
     if (should_log(hr))
         LOG("[d3d12] CreateCommandQueue(type=%d prio=%d flags=0x%x) -> 0x%08lx", desc->Type, desc->Priority,
             desc->Flags, hr);
-    if (SUCCEEDED(hr)) vt_patch(*out, kVtCommandQueue);
+    if (SUCCEEDED(hr)) {
+        vt_patch(*out, kVtCommandQueue);
+        vt_override(*out, 18, reinterpret_cast<void*>(&Queue_GetTimestampFrequencyX));
+    }
     return hr;
 }
 
@@ -566,6 +577,24 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandSignature(ID3D12Device* self, cons
                                                         ID3D12RootSignature* rs, REFIID, void** out) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*,
                                            REFIID, void**);
+    {
+        // Diagnostic (VICEPC_WATCH=2): watch the title's per-thread render context
+        // (TLS block + 0x12A8), which is set just before this call during device setup.
+        char w[4] = "";
+        static bool armed = false;
+        if (!armed && GetEnvironmentVariableA("VICEPC_WATCH", w, sizeof(w)) && w[0] == '2') {
+            armed = true;
+            auto** tls = reinterpret_cast<uint8_t**>(__readgsqword(0x58));
+            uint8_t* field = tls[0] + 0x12A8;
+            LOG("[watch] render context field %p = %p (thread %lu)", field, *reinterpret_cast<void**>(field), GetCurrentThreadId());
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            GetThreadContext(GetCurrentThread(), &ctx);
+            ctx.Dr0 = reinterpret_cast<DWORD64>(field);
+            ctx.Dr7 = 1 | ((0x1ull | (0x2ull << 2)) << 16);
+            SetThreadContext(GetCurrentThread(), &ctx);
+        }
+    }
     HRESULT hr = orig<Fn>(self, 41)(self, desc, rs, __uuidof(ID3D12CommandSignature), out);
     char types[96] = "";
     size_t len = 0;
