@@ -54,3 +54,6 @@ void* vt_original(void* obj, int slot);
 
 // True if obj's vptr is one of our patched tables (a live, title-facing object).
 bool vt_is_patched(const void* obj);
+
+// --trace-d3d: callback that reports whether the device has been lost.
+void vt_set_removed_check(bool (*fn)());

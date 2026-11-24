@@ -15,6 +15,8 @@
 #include <windows.h>
 #include <malloc.h>
 #include <atomic>
+#include <mutex>
+#include <unordered_set>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -141,14 +143,44 @@ BOOL __cdecl XMemFreePhysicalPages_hle(uint64_t flags, uint64_t* page_count, uin
     return TRUE;
 }
 
+// 64 KB pages committed by the XMem map calls. Unmapping only decommits pages in this
+// set: decommitting anything else could hit memory another component (e.g. the GPU
+// driver) owns in a gap of the title's address space, which removes the device.
+std::mutex g_owned_mu;
+std::unordered_set<uint64_t>& g_owned = *new std::unordered_set<uint64_t>();
+std::atomic<uint64_t> g_skipped_unmaps{0};
+
+void own_pages(void* va, size_t bytes, bool own) {
+    std::lock_guard<std::mutex> lk(g_owned_mu);
+    for (uint64_t a = reinterpret_cast<uint64_t>(va); a < reinterpret_cast<uint64_t>(va) + bytes; a += kPhysPageSize) {
+        if (own) g_owned.insert(a);
+        else g_owned.erase(a);
+    }
+}
+
+// Decommit [va, va+bytes) page by page, only where we committed. Returns true.
+bool unmap_owned(void* va, size_t bytes) {
+    for (uint64_t a = reinterpret_cast<uint64_t>(va); a < reinterpret_cast<uint64_t>(va) + bytes; a += kPhysPageSize) {
+        bool owned;
+        {
+            std::lock_guard<std::mutex> lk(g_owned_mu);
+            owned = g_owned.erase(a) != 0;
+        }
+        if (owned) VirtualFree(reinterpret_cast<void*>(a), kPhysPageSize, MEM_DECOMMIT);
+        else g_skipped_unmaps.fetch_add(1);
+    }
+    return true;
+}
+
 BOOL map_range(void* va, uint64_t pages, const uint64_t* page_array, const char* api) {
     size_t bytes = (size_t)(pages * kPhysPageSize);
     void* p;
     if (page_array) {
         p = VirtualAlloc(va, bytes, MEM_COMMIT, PAGE_READWRITE);
         if (!p) p = VirtualAlloc(va, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);  // not inside a reservation
+        if (p) own_pages(va, bytes, true);
     } else {
-        p = VirtualFree(va, bytes, MEM_DECOMMIT) ? va : nullptr;  // NULL page array = unmap
+        p = unmap_owned(va, bytes) ? va : nullptr;  // NULL page array = unmap
     }
     if (g_phys_logged.fetch_add(1) < 32 || !p) {
         LOG("[xmem] %s(va=%p, %llu pages, %s) -> %s%s", api, va, (unsigned long long)pages,
@@ -175,9 +207,9 @@ BOOL __cdecl XMemMapPhysicalPagesScatter_hle(const uint64_t* vas, uint64_t count
         if (pfns[i]) {
             p = VirtualAlloc(va, kPhysPageSize, MEM_COMMIT, PAGE_READWRITE);
             if (!p) p = VirtualAlloc(va, kPhysPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (p) ++mapped;
+            if (p) { ++mapped; own_pages(va, kPhysPageSize, true); }
         } else {
-            p = VirtualFree(va, kPhysPageSize, MEM_DECOMMIT) ? va : nullptr;
+            p = unmap_owned(va, kPhysPageSize) ? va : nullptr;
         }
         if (!p) {
             LOG("[xmem] XMemMapPhysicalPagesScatter: page %u at %p failed (error %lu)", i, va, GetLastError());
@@ -187,8 +219,9 @@ BOOL __cdecl XMemMapPhysicalPagesScatter_hle(const uint64_t* vas, uint64_t count
     if (g_scatter_logged.fetch_add(1) < 16) {
         uint64_t lo = ~0ull, hi = 0;
         for (uint32_t i = 0; i < n; ++i) { lo = vas[i] < lo ? vas[i] : lo; hi = vas[i] > hi ? vas[i] : hi; }
-        LOG("[xmem] XMemMapPhysicalPagesScatter(%u pages at 0x%llx..0x%llx, %u mapped) -> %s", n,
-            (unsigned long long)lo, (unsigned long long)hi, mapped, ok ? "ok" : "FAILED");
+        LOG("[xmem] XMemMapPhysicalPagesScatter(%u pages at 0x%llx..0x%llx, %u mapped) -> %s (%llu foreign pages left alone)",
+            n, (unsigned long long)lo, (unsigned long long)hi, mapped, ok ? "ok" : "FAILED",
+            (unsigned long long)g_skipped_unmaps.load());
     }
     return ok;
 }

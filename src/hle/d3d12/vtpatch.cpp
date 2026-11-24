@@ -120,11 +120,25 @@ struct TraceInfo {
 };
 
 std::atomic<int> g_trace_lines{0};
+bool (*g_removed_check)() = nullptr;
 
 void __cdecl trace_call(const TraceInfo* t, void* ret) {
     uint64_t rva;
     if (!hle_rva(ret, &rva)) return;  // only title calls
-    if (g_trace_lines.fetch_add(1) >= 20000) return;
+    // Device health before every traced call: the first time it is lost, name the previous call.
+    static const TraceInfo* volatile last = nullptr;
+    static volatile uint64_t last_rva = 0;
+    static bool reported = false;
+    if (!reported && g_removed_check && g_removed_check()) {
+        reported = true;
+        LOG("[trace] DEVICE LOST before %s::slot%d (game+0x%llx); previous traced call: %s::slot%d from game+0x%llx",
+            t->iface, t->slot, (unsigned long long)rva, last ? last->iface : "?", last ? last->slot : -1,
+            (unsigned long long)last_rva);
+        log_flush();
+    }
+    last = t;
+    last_rva = rva;
+    if (g_trace_lines.fetch_add(1) >= 400000) return;
     LOG("[trace] %s::slot%d from game+0x%llx", t->iface, t->slot, (unsigned long long)rva);
     log_flush();
 }
@@ -230,3 +244,5 @@ bool vt_is_patched(const void* obj) {
     std::lock_guard<std::mutex> lk(g_mu);
     return by_table.count(vt) != 0;
 }
+
+void vt_set_removed_check(bool (*fn)()) { g_removed_check = fn; }

@@ -111,7 +111,9 @@ void STDMETHODCALLTYPE Queue_EnqueueStatus(ProbeObject*, void* status, uint32_t 
 }
 
 void STDMETHODCALLTYPE Queue_EnqueueSignal(ProbeObject*, ID3D12Fence* fence, uint64_t value) {
-    LOG("[dstorage] EnqueueSignal(%p, %llu) -> signalled", fence, (unsigned long long)value);
+    static std::atomic<int> sig{0};
+    if (sig.fetch_add(1) < 10 || value > (1ull << 48))
+        LOG("[dstorage] EnqueueSignal(%p, 0x%llx) -> signalled", fence, (unsigned long long)value);
     if (fence) fence->Signal(value);
 }
 

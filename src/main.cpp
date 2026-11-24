@@ -83,6 +83,32 @@ void log_string_args(const CONTEXT& c) {
 }
 bool g_trap_fastfail = false;
 
+// VICEPC_BP=<rva>[,<rva>...]: one-shot breakpoints for diagnostics. The byte at each RVA is
+// replaced with int3; on hit, registers / strings / backtrace are logged, the original
+// byte is restored and execution continues.
+struct OneShotBp { uint64_t rva; uint8_t orig; bool armed; int hits; };
+volatile LONG g_bp_rearm = -1;  // breakpoint to re-insert after the single step (diagnostics only)
+OneShotBp g_bps[8];
+int g_nbps = 0;
+
+void arm_breakpoints(LoadedImage& img) {
+    char v[256] = "";
+    if (!GetEnvironmentVariableA("VICEPC_BP", v, sizeof(v))) return;
+    for (char* p = v; *p && g_nbps < 8;) {
+        uint64_t rva = strtoull(p, &p, 16);
+        if (rva && rva < img.size) {
+            DWORD old;
+            VirtualProtect(img.base + rva, 1, PAGE_EXECUTE_READWRITE, &old);
+            g_bps[g_nbps] = {rva, img.base[rva], true, 0};
+            img.base[rva] = 0xCC;
+            VirtualProtect(img.base + rva, 1, old, &old);
+            LOG("[bp] armed game+0x%llx", (unsigned long long)rva);
+            ++g_nbps;
+        }
+        while (*p == ',' || *p == ' ') ++p;
+    }
+}
+
 // --trap-fastfail: __fastfail (int 29h) ends the process without running any exception
 // handler. Rewrite the title's "mov ecx, code; int 29h" sequences to "mov ecx, code; ud2"
 // so the vectored handler can log the reason code and a backtrace. Diagnostic only.
@@ -111,6 +137,37 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
     // Titles use __debugbreak() as "tell the debugger" on non-fatal failures and then
     // carry on. With no debugger attached that would kill the process, so log it and
     // step over the 1-byte int3.
+    if (code == EXCEPTION_BREAKPOINT && g_img.contains(ep->ExceptionRecord->ExceptionAddress)) {
+        uint64_t rva = g_img.rva_of(ep->ExceptionRecord->ExceptionAddress);
+        for (int i = 0; i < g_nbps; ++i) {
+            if (g_bps[i].armed && g_bps[i].rva == rva) {
+                const CONTEXT& c = *ep->ContextRecord;
+                int hit = ++g_bps[i].hits;
+                if (hit <= 400) {
+                    char mem[200] = "";
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (VirtualQuery(reinterpret_cast<void*>(c.R8), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+                        auto* b = reinterpret_cast<const uint8_t*>(c.R8);
+                        size_t len = 0;
+                        for (int k = 0; k < 32; ++k) len += snprintf(mem + len, sizeof(mem) - len, "%02x", b[k]);
+                    }
+                    LOG("[bp] hit #%d game+0x%llx (thread %lu) rcx=%llx rdx=%llx r8=%llx r9=%llx [r8]=%s", hit,
+                        (unsigned long long)rva, GetCurrentThreadId(), c.Rcx, c.Rdx, c.R8, c.R9, mem);
+                    if (hit == 1) { log_string_args(c); print_backtrace(c); }
+                    log_flush();
+                }
+                // re-arm after one single step
+                ep->ContextRecord->EFlags |= 0x100;
+                InterlockedExchange(&g_bp_rearm, i);
+                DWORD old;
+                VirtualProtect(g_img.base + rva, 1, PAGE_EXECUTE_READWRITE, &old);
+                g_img.base[rva] = g_bps[i].orig;
+                VirtualProtect(g_img.base + rva, 1, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), g_img.base + rva, 1);
+                return EXCEPTION_CONTINUE_EXECUTION;  // Rip already points at the restored instruction
+            }
+        }
+    }
     if (code == EXCEPTION_BREAKPOINT && g_skip_int3 && g_img.contains(ep->ExceptionRecord->ExceptionAddress)) {
         static std::atomic<int> skipped{0};
         int n = skipped.fetch_add(1);
@@ -120,6 +177,18 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
             log_string_args(*ep->ContextRecord);
         }
         ep->ContextRecord->Rip += 1;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code == EXCEPTION_SINGLE_STEP && g_bp_rearm >= 0 && !(ep->ContextRecord->Dr6 & 0xF)) {
+        LONG i = InterlockedExchange(&g_bp_rearm, -1);
+        if (i >= 0) {
+            DWORD old;
+            uint8_t* at = g_img.base + g_bps[i].rva;
+            VirtualProtect(at, 1, PAGE_EXECUTE_READWRITE, &old);
+            *at = 0xCC;
+            VirtualProtect(at, 1, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), at, 1);
+        }
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 0xF)) {
@@ -298,6 +367,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!tls_setup(g_img)) return 2;
     if (g_trap_fastfail) LOG("[ldr] --trap-fastfail: %d __fastfail sites patched", patch_fastfails(g_img));
     pe_protect_sections(g_img);
+    arm_breakpoints(g_img);
 
     if (no_run) {
         LOG("--no-run: image is mapped and linked; not executing.");

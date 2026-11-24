@@ -21,6 +21,7 @@
 #include <dxgi1_6.h>
 #include <atomic>
 #include <cstdio>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +53,11 @@ void* ret_addr_rva(void* ra) {
 #define CALLER ret_addr_rva(_ReturnAddress())
 
 bool from_game(void* ra);
+void postcheck(ID3D12Device* dev, const char* what, uint64_t a = 0, uint64_t b = 0);
+// Real PC descriptor heap CPU ranges (start -> bytes); see vcpu().
+std::mutex g_real_heap_mu;
+std::map<uint64_t, uint64_t>& g_real_heaps = *new std::map<uint64_t, uint64_t>();
+
 
 void patch_resource(void* r);
 
@@ -91,13 +97,37 @@ HRESULT STDMETHODCALLTYPE Queue_GetTimestampFrequencyX(ID3D12CommandQueue* self,
 // Xbox ID3D12CommandQueue has two extra methods before Signal: Xbox slots 16..20 are
 // PC slots 14..18 (Signal, Wait, GetTimestampFrequency, GetClockCalibration, GetDesc).
 // Reference title: slot 16 called as (fence, value) at game+0x2482608.
+// Fences created through the title device. Signal/Wait on anything else is an Xbox-only
+// object (or a misread argument) and would remove the PC device (DXGI_ERROR_INVALID_CALL).
+std::mutex g_known_fence_mu;
+std::unordered_map<void*, bool>& g_known_fences = *new std::unordered_map<void*, bool>();
+bool known_fence(void* f) {
+    std::lock_guard<std::mutex> lk(g_known_fence_mu);
+    return g_known_fences.count(f) != 0;
+}
+void log_foreign_fence(const char* op, void* f, UINT64 v, void* ra) {
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 12)
+        LOG("[d3d12] Queue::%s on non-fence object %p (vptr %p, value 0x%llx) from %p: skipped", op, f,
+            f ? *static_cast<void**>(f) : nullptr, (unsigned long long)v, ret_addr_rva(ra));
+}
+
 HRESULT STDMETHODCALLTYPE Queue_SignalX(ID3D12CommandQueue* self, ID3D12Fence* fence, UINT64 value) {
+    if (!known_fence(fence)) { log_foreign_fence("Signal", fence, value, _ReturnAddress()); return S_OK; }
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
-    return orig<Fn>(self, 14)(self, fence, value);
+    static std::atomic<int> big{0};
+    if (value > (1ull << 48) && big.fetch_add(1) < 10)
+        LOG("[d3d12] Queue::Signal(fence %p, 0x%llx) from %p - suspicious value", fence, (unsigned long long)value, CALLER);
+    HRESULT hr = orig<Fn>(self, 14)(self, fence, value);
+    postcheck(g_device, "Queue::Signal", reinterpret_cast<uint64_t>(fence), value);
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE Queue_WaitX(ID3D12CommandQueue* self, ID3D12Fence* fence, UINT64 value) {
+    if (!known_fence(fence)) { log_foreign_fence("Wait", fence, value, _ReturnAddress()); return S_OK; }
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
-    return orig<Fn>(self, 15)(self, fence, value);
+    HRESULT hr = orig<Fn>(self, 15)(self, fence, value);
+    postcheck(g_device, "Queue::Wait", reinterpret_cast<uint64_t>(fence), value);
+    return hr;
 }
 HRESULT STDMETHODCALLTYPE Queue_GetClockCalibrationX(ID3D12CommandQueue* self, UINT64* gpu, UINT64* cpu) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT64*, UINT64*);
@@ -157,6 +187,21 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3
             desc->Flags, hr);
     if (SUCCEEDED(hr)) {
         vt_patch(*out, kVtCommandQueue);
+        // Xbox queue slots 8..15 do not line up with PC (two extra methods before Signal);
+        // forwarding them (e.g. into PC ExecuteCommandLists with title lists) removes the device.
+        {
+            static void* qstubs[16] = {};
+            static bool made = false;
+            if (!made) {
+                made = true;
+                for (int s = 8; s < 16; ++s) {
+                    char name[48];
+                    snprintf(name, sizeof(name), "slot%d (Xbox, not forwarded)", s);
+                    qstubs[s] = stub_create("ID3D12CommandQueue", _strdup(name), stub_stop_mode());
+                }
+            }
+            for (int s = 8; s < 16; ++s) vt_override(*out, s, qstubs[s]);
+        }
         vt_override(*out, 16, reinterpret_cast<void*>(&Queue_SignalX));
         vt_override(*out, 17, reinterpret_cast<void*>(&Queue_WaitX));
         vt_override(*out, 18, reinterpret_cast<void*>(&Queue_GetTimestampFrequencyX));
@@ -167,12 +212,19 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3
     return hr;
 }
 
+// Title command lists are title-owned (cmdlist.cpp) and never record into PC allocators,
+// so allocator Reset (slot 8) has nothing to do.
+HRESULT STDMETHODCALLTYPE Allocator_ResetX(ID3D12CommandAllocator*) { return S_OK; }
+
 HRESULT STDMETHODCALLTYPE Device_CreateCommandAllocator(ID3D12Device* self, D3D12_COMMAND_LIST_TYPE type, REFIID,
                                                         void** out) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, D3D12_COMMAND_LIST_TYPE, REFIID, void**);
     HRESULT hr = orig<Fn>(self, 9)(self, type, __uuidof(ID3D12CommandAllocator), out);
     if (should_log(hr)) LOG("[d3d12] CreateCommandAllocator(type=%d) -> 0x%08lx", type, hr);
-    if (SUCCEEDED(hr)) vt_patch(*out, kVtCommandAllocator);
+    if (SUCCEEDED(hr)) {
+        vt_patch(*out, kVtCommandAllocator);
+        vt_override(*out, 8, reinterpret_cast<void*>(&Allocator_ResetX));
+    }
     return hr;
 }
 
@@ -281,6 +333,13 @@ HRESULT STDMETHODCALLTYPE Device_CreateDescriptorHeap(ID3D12Device* self, const 
         auto* heap = static_cast<ID3D12DescriptorHeap*>(*out);
         vt_patch(heap, kVtDescriptorHeap);
         vt_override(heap, 9, reinterpret_cast<void*>(&Heap_GetCPUStart));
+        {
+            using StartFn2 = D3D12_CPU_DESCRIPTOR_HANDLE*(STDMETHODCALLTYPE*)(ID3D12DescriptorHeap*, D3D12_CPU_DESCRIPTOR_HANDLE*);
+            D3D12_CPU_DESCRIPTOR_HANDLE rs;
+            orig<StartFn2>(heap, 9)(heap, &rs);
+            std::lock_guard<std::mutex> lk(g_real_heap_mu);
+            g_real_heaps[rs.ptr] = uint64_t(self->GetDescriptorHandleIncrementSize(desc->Type)) * desc->NumDescriptors;
+        }
         if (want) {
             using StartFn = D3D12_CPU_DESCRIPTOR_HANDLE*(STDMETHODCALLTYPE*)(ID3D12DescriptorHeap*,
                                                                              D3D12_CPU_DESCRIPTOR_HANDLE*);
@@ -296,9 +355,45 @@ HRESULT STDMETHODCALLTYPE Device_CreateDescriptorHeap(ID3D12Device* self, const 
 
 // ---- views: destination handles (and CBV buffer addresses) are title addresses ----
 
+// After a forwarded call: if the device just got lost, name the call (first time only).
+std::atomic<bool> g_loss_named{false};
+void postcheck(ID3D12Device* dev, const char* what, uint64_t a, uint64_t b) {
+    if (g_loss_named.load(std::memory_order_relaxed) || !dev) return;
+    HRESULT why = dev->GetDeviceRemovedReason();
+    if (why != S_OK && !g_loss_named.exchange(true)) {
+        LOG("[d3d12] DEVICE LOST in %s (args 0x%llx, 0x%llx), reason 0x%08lx", what, (unsigned long long)a,
+            (unsigned long long)b, why);
+        log_flush();
+    }
+}
+
+// Real PC descriptor heap CPU ranges (start -> bytes). A handle that is neither in a title
+// heap range nor in a real heap is title memory (Xbox lets titles keep descriptors anywhere);
+// passing it to D3D12 removes the device, so such writes are dropped.
+std::atomic<uint64_t> g_dropped_desc{0};
+
+bool in_real_heap(uint64_t h) {
+    std::lock_guard<std::mutex> lk(g_real_heap_mu);
+    auto it = g_real_heaps.upper_bound(h);
+    if (it == g_real_heaps.begin()) return false;
+    --it;
+    return h - it->first < it->second;
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE tcpu(D3D12_CPU_DESCRIPTOR_HANDLE h) {
     h.ptr = static_cast<SIZE_T>(gm_translate(GM_DESC_CPU, h.ptr));
     return h;
+}
+
+// Translated handle, or {0} if it points at title memory rather than a descriptor heap.
+D3D12_CPU_DESCRIPTOR_HANDLE vcpu(D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    D3D12_CPU_DESCRIPTOR_HANDLE t = tcpu(h);
+    if (t.ptr && in_real_heap(t.ptr)) return t;
+    uint64_t n = g_dropped_desc.fetch_add(1) + 1;
+    if ((n & (n - 1)) == 0)
+        LOG("[d3d12] %llu descriptor writes to title memory dropped (e.g. handle 0x%llx)", (unsigned long long)n,
+            (unsigned long long)h.ptr);
+    return D3D12_CPU_DESCRIPTOR_HANDLE{0};
 }
 
 void STDMETHODCALLTYPE Device_CreateCBV(ID3D12Device* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* d,
@@ -307,7 +402,10 @@ void STDMETHODCALLTYPE Device_CreateCBV(ID3D12Device* self, const D3D12_CONSTANT
                                         D3D12_CPU_DESCRIPTOR_HANDLE);
     D3D12_CONSTANT_BUFFER_VIEW_DESC t;
     if (d) { t = *d; t.BufferLocation = gm_translate(GM_GPU_VA, t.BufferLocation); }
-    orig<Fn>(self, 17)(self, d ? &t : nullptr, tcpu(h));
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+    if (!dst.ptr) return;
+    orig<Fn>(self, 17)(self, d ? &t : nullptr, dst);
+    postcheck(self, "CreateCBV", h.ptr, d ? d->BufferLocation : 0);
 }
 
 void STDMETHODCALLTYPE Device_CreateSRV(ID3D12Device* self, ID3D12Resource* r, const D3D12_SHADER_RESOURCE_VIEW_DESC* d,
@@ -320,34 +418,49 @@ void STDMETHODCALLTYPE Device_CreateSRV(ID3D12Device* self, ID3D12Resource* r, c
         t.RaytracingAccelerationStructure.Location = gm_translate(GM_GPU_VA, t.RaytracingAccelerationStructure.Location);
         d = &t;
     }
-    orig<Fn>(self, 18)(self, r, d, tcpu(h));
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+    if (!dst.ptr) return;
+    orig<Fn>(self, 18)(self, r, d, dst);
+    postcheck(self, "CreateSRV", h.ptr, reinterpret_cast<uint64_t>(r));
 }
 
 void STDMETHODCALLTYPE Device_CreateUAV(ID3D12Device* self, ID3D12Resource* r, ID3D12Resource* counter,
                                         const D3D12_UNORDERED_ACCESS_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*,
                                         const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
-    orig<Fn>(self, 19)(self, r, counter, d, tcpu(h));
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+    if (!dst.ptr) return;
+    orig<Fn>(self, 19)(self, r, counter, d, dst);
+    postcheck(self, "CreateUAV", h.ptr, reinterpret_cast<uint64_t>(r));
 }
 
 void STDMETHODCALLTYPE Device_CreateRTV(ID3D12Device* self, ID3D12Resource* r, const D3D12_RENDER_TARGET_VIEW_DESC* d,
                                         D3D12_CPU_DESCRIPTOR_HANDLE h) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*,
                                         D3D12_CPU_DESCRIPTOR_HANDLE);
-    orig<Fn>(self, 20)(self, r, d, tcpu(h));
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+    if (!dst.ptr) return;
+    orig<Fn>(self, 20)(self, r, d, dst);
+    postcheck(self, "CreateRTV", h.ptr, reinterpret_cast<uint64_t>(r));
 }
 
 void STDMETHODCALLTYPE Device_CreateDSV(ID3D12Device* self, ID3D12Resource* r, const D3D12_DEPTH_STENCIL_VIEW_DESC* d,
                                         D3D12_CPU_DESCRIPTOR_HANDLE h) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*,
                                         D3D12_CPU_DESCRIPTOR_HANDLE);
-    orig<Fn>(self, 21)(self, r, d, tcpu(h));
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+    if (!dst.ptr) return;
+    orig<Fn>(self, 21)(self, r, d, dst);
+    postcheck(self, "CreateDSV", h.ptr, reinterpret_cast<uint64_t>(r));
 }
 
 void STDMETHODCALLTYPE Device_CreateSampler(ID3D12Device* self, const D3D12_SAMPLER_DESC* d,
                                             D3D12_CPU_DESCRIPTOR_HANDLE h) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_SAMPLER_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
-    orig<Fn>(self, 22)(self, d, tcpu(h));
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+    if (!dst.ptr) return;
+    orig<Fn>(self, 22)(self, d, dst);
+    postcheck(self, "CreateSampler", h.ptr);
 }
 
 void STDMETHODCALLTYPE Device_CopyDescriptors(ID3D12Device* self, UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* ds,
@@ -358,9 +471,11 @@ void STDMETHODCALLTYPE Device_CopyDescriptors(ID3D12Device* self, UINT nd, const
     D3D12_CPU_DESCRIPTOR_HANDLE sd[64], sss[64];
     D3D12_CPU_DESCRIPTOR_HANDLE* td = nd <= 64 ? sd : new D3D12_CPU_DESCRIPTOR_HANDLE[nd];
     D3D12_CPU_DESCRIPTOR_HANDLE* ts = ns <= 64 ? sss : new D3D12_CPU_DESCRIPTOR_HANDLE[ns];
-    for (UINT i = 0; i < nd; ++i) td[i] = tcpu(ds[i]);
-    for (UINT i = 0; i < ns; ++i) ts[i] = tcpu(ss[i]);
-    orig<Fn>(self, 23)(self, nd, td, dsz, ns, ts, ssz, type);
+    bool bad = false;
+    for (UINT i = 0; i < nd; ++i) { td[i] = vcpu(ds[i]); bad |= !td[i].ptr; }
+    for (UINT i = 0; i < ns; ++i) { ts[i] = vcpu(ss[i]); bad |= !ts[i].ptr; }
+    if (!bad) orig<Fn>(self, 23)(self, nd, td, dsz, ns, ts, ssz, type);
+    postcheck(self, "CopyDescriptors", nd ? ds[0].ptr : 0, ns ? ss[0].ptr : 0);
     if (td != sd) delete[] td;
     if (ts != sss) delete[] ts;
 }
@@ -369,7 +484,10 @@ void STDMETHODCALLTYPE Device_CopyDescriptorsSimple(ID3D12Device* self, UINT n, 
                                                     D3D12_CPU_DESCRIPTOR_HANDLE s, D3D12_DESCRIPTOR_HEAP_TYPE type) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
                                         D3D12_DESCRIPTOR_HEAP_TYPE);
-    orig<Fn>(self, 24)(self, n, tcpu(d), tcpu(s), type);
+    D3D12_CPU_DESCRIPTOR_HANDLE dd = vcpu(d), sd = vcpu(s);
+    if (!dd.ptr || !sd.ptr) return;
+    orig<Fn>(self, 24)(self, n, dd, sd, type);
+    postcheck(self, "CopyDescriptorsSimple", d.ptr, s.ptr);
 }
 
 UINT element_bytes(DXGI_FORMAT f) {
@@ -389,6 +507,15 @@ UINT element_bytes(DXGI_FORMAT f) {
         case DXGI_FORMAT_R8_SNORM: return 1;
         default: return 4;
     }
+}
+
+// VICEPC_NULL_TEXTURE_VIEWS=1: texture views made from addresses become null views (diagnostic).
+bool no_texture_views() {
+    static const bool on = [] {
+        char v[4] = "";
+        return GetEnvironmentVariableA("VICEPC_NULL_TEXTURE_VIEWS", v, sizeof(v)) && v[0] == '1';
+    }();
+    return on;
 }
 
 // Xbox SRV desc: the PC fields, then the GPU address of the data (no resource object).
@@ -417,7 +544,19 @@ void STDMETHODCALLTYPE Device_CreateSRVAtAddressX(ID3D12Device* self, const D3D1
         UINT el = d.Buffer.StructureByteStride ? d.Buffer.StructureByteStride
                   : (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4 : element_bytes(d.Format);
         d.Buffer.FirstElement += byte_off / el;
-    } else if (ok && off == 0 && d.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+        // PC rejects views that run past the buffer (and removes the device); Xbox does not check.
+        UINT64 width = res->GetDesc().Width;
+        UINT64 total = width / el;
+        if (d.Buffer.FirstElement >= total) {
+            res = nullptr;
+        } else if (d.Buffer.FirstElement + d.Buffer.NumElements > total) {
+            d.Buffer.NumElements = static_cast<UINT>(total - d.Buffer.FirstElement);
+        }
+        if (res && (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) && d.Format != DXGI_FORMAT_R32_TYPELESS)
+            d.Format = DXGI_FORMAT_R32_TYPELESS;  // raw views must be R32_TYPELESS on PC
+        if (res && d.Buffer.StructureByteStride && d.Format != DXGI_FORMAT_UNKNOWN)
+            d.Format = DXGI_FORMAT_UNKNOWN;  // structured views must use UNKNOWN
+    } else if (ok && off == 0 && d.ViewDimension != D3D12_SRV_DIMENSION_BUFFER && !no_texture_views()) {
         res = static_cast<ID3D12Resource*>(owner);  // texture view on the texture created at that address
         if (!vt_is_patched(res)) {
             static std::atomic<int> bad{0};
@@ -507,10 +646,14 @@ void STDMETHODCALLTYPE Device_CreateSRVAtAddressX(ID3D12Device* self, const D3D1
         n.Format = DXGI_FORMAT_R32_UINT;
         n.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
         n.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        orig<Fn>(self, 18)(self, nullptr, &n, tcpu(h));
+        D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+        if (dst.ptr) orig<Fn>(self, 18)(self, nullptr, &n, dst);
         return;
     }
-    orig<Fn>(self, 18)(self, res, &d, tcpu(h));
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
+    if (!dst.ptr) return;
+    orig<Fn>(self, 18)(self, res, &d, dst);
+    postcheck(self, "CreateSRVAtAddressX", h.ptr, x->gpu_va);
 }
 
 // ---- resources at title-chosen GPU addresses ------------------------------------
@@ -531,8 +674,30 @@ ULONG STDMETHODCALLTYPE Resource_Release(ID3D12Resource* self) {
     return n;
 }
 
+// ID3D12Resource slots 8/9 (Map/Unmap). A resource created at a title address *is*
+// title memory on Xbox, so Map returns that address. The PC resource behind it is
+// GPU-only and cannot be mapped (mapping it removed the device).
+HRESULT STDMETHODCALLTYPE Resource_Map(ID3D12Resource* self, UINT sub, const D3D12_RANGE* range, void** data) {
+    uint64_t game;
+    if (gm_object(GM_GPU_VA, self, &game)) {
+        if (data) *data = reinterpret_cast<void*>(game);
+        return S_OK;
+    }
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*, void**);
+    return orig<Fn>(self, 8)(self, sub, range, data);
+}
+
+void STDMETHODCALLTYPE Resource_Unmap(ID3D12Resource* self, UINT sub, const D3D12_RANGE* range) {
+    uint64_t game;
+    if (gm_object(GM_GPU_VA, self, &game)) return;
+    using Fn = void(STDMETHODCALLTYPE*)(ID3D12Resource*, UINT, const D3D12_RANGE*);
+    orig<Fn>(self, 9)(self, sub, range);
+}
+
 void patch_resource(void* r) {
     vt_patch(r, kVtResource);
+    vt_override(r, 8, reinterpret_cast<void*>(&Resource_Map));
+    vt_override(r, 9, reinterpret_cast<void*>(&Resource_Unmap));
     vt_override(r, 2, reinterpret_cast<void*>(&Resource_Release));
     vt_override(r, 11, reinterpret_cast<void*>(&Resource_GetGPUVirtualAddress));
 }
@@ -727,6 +892,14 @@ DWORD WINAPI fence_updater(void*) {
         {
             std::lock_guard<std::mutex> lk(g_fence_mu);
             for (FenceCell* c : g_fence_cells) c->value = fence_completed(c->fence);
+            static bool reported = false;
+            if (!reported && g_device) {
+                HRESULT why = g_device->GetDeviceRemovedReason();
+                if (why != S_OK) {
+                    reported = true;
+                    LOG("[d3d12] device removed (detected by fence thread), reason 0x%08lx", why);
+                }
+            }
         }
         Sleep(1);
     }
@@ -761,6 +934,10 @@ HRESULT STDMETHODCALLTYPE Device_CreateFence(ID3D12Device* self, UINT64 initial,
     if (should_log(hr)) LOG("[d3d12] CreateFence(%llu, flags=0x%x) -> 0x%08lx", (unsigned long long)initial, flags, hr);
     if (SUCCEEDED(hr)) {
         vt_patch(*out, kVtFence);
+        {
+            std::lock_guard<std::mutex> lk(g_known_fence_mu);
+            g_known_fences[*out] = true;
+        }
         vt_override(*out, 12, reinterpret_cast<void*>(&Fence_GetCompletedValueAddressX));
     }
     return hr;
@@ -992,6 +1169,31 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Device_GetResourceAllocationIn
     return ret;
 }
 
+// Xbox-only device slot 108: GetResourceAllocationInfo1-style call (game+0xabfda9 / +0xabfe07):
+// C-style sret (ret, device, nodeMask, count, descs, D3D12_RESOURCE_ALLOCATION_INFO1* perResource).
+// The title's texture-size routine uses it; as a stub it left size/alignment unset, the
+// title's GPU pool allocator then failed and texture creation returned null.
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Device_GetResourceAllocationInfoX(
+    void* a1, void* a2, UINT mask, UINT n, const D3D12_RESOURCE_DESC* descs, D3D12_RESOURCE_ALLOCATION_INFO1* per) {
+    D3D12_RESOURCE_ALLOCATION_INFO* ret = Device_GetResourceAllocationInfo(a1, a2, mask, n, descs);
+    if (per) {
+        UINT64 offset = 0;
+        for (UINT i = 0; i < n && i < 16; ++i) {
+            D3D12_RESOURCE_ALLOCATION_INFO one;
+            Device_GetResourceAllocationInfo(g_device, &one, mask, 1, &descs[i]);
+            offset = (offset + one.Alignment - 1) & ~(one.Alignment - 1);
+            per[i] = {offset, one.Alignment, one.SizeInBytes};
+            offset += one.SizeInBytes;
+        }
+    }
+    static std::atomic<int> n_logged{0};
+    if (n_logged.fetch_add(1) < 6)
+        LOG("[d3d12] GetResourceAllocationInfoX(dim=%d %llux%u fmt=%d) -> %llu bytes, align %llu", descs[0].Dimension,
+            (unsigned long long)descs[0].Width, descs[0].Height, descs[0].Format, (unsigned long long)ret->SizeInBytes,
+            (unsigned long long)ret->Alignment);
+    return ret;
+}
+
 HRESULT STDMETHODCALLTYPE Device_CheckFeatureSupport(ID3D12Device* self, D3D12_FEATURE f, void* data, UINT size) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, D3D12_FEATURE, void*, UINT);
     HRESULT hr = orig<Fn>(self, 13)(self, f, data, size);
@@ -1082,6 +1284,7 @@ HRESULT d3d12_create_title_device(void** out) {
     OV(70, Device_CreateSRVAtAddressX);    // Xbox: buffer SRV from a GPU VA
     OV(133, Device_CreateResourceAtAddressX);  // Xbox: resource at a title-chosen GPU VA
     OV(25, Device_GetResourceAllocationInfo);
+    OV(108, Device_GetResourceAllocationInfoX);  // Xbox: allocation info + per-resource info
     OV(17, Device_CreateCBV);
     OV(18, Device_CreateSRV);
     OV(19, Device_CreateUAV);
@@ -1093,6 +1296,7 @@ HRESULT d3d12_create_title_device(void** out) {
 #undef OV
     g_device = dev;
     g_device->AddRef();
+    vt_set_removed_check([] { return g_device && g_device->GetDeviceRemovedReason() != S_OK; });
     *out = dev;
     return S_OK;
 }
