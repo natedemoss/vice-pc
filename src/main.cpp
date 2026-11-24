@@ -84,7 +84,7 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
         }
         // Heap corruption fails fast and never reaches the unhandled filter, so trace it here.
         // Breakpoints are the title's asserts / fatal-error paths: trace those too.
-        if (code == 0xC0000374 || code == EXCEPTION_BREAKPOINT) {
+        if (code == 0xC0000374 || code == EXCEPTION_BREAKPOINT || code == EXCEPTION_ACCESS_VIOLATION) {
             print_backtrace(*ep->ContextRecord);
             log_flush();
         }
@@ -189,7 +189,9 @@ int wmain(int argc, wchar_t** argv) {
 
     if (!pe_map(exe.wstring(), g_img)) return 2;
     stub_set_image_range(g_img.base, g_img.size);
-    hle_set_image_base(g_img.base);
+    hle_set_image_base(g_img.base, g_img.size);
+    hle_set_game_path(exe.wstring());
+    hle_set_package_root(root.wstring());
 
     ImportStats st;
     if (!pe_resolve_imports(g_img, opt, st)) return 2;

@@ -32,14 +32,17 @@ Each run of `--stop-on-stub` gets further. Stops so far, in order:
 | 3 | Bad virtual call in a static constructor | **Loader fix:** title reads TLS from slot 0 directly (local-exec model), so the game's block now lives in slot 0 |
 | 4 | `__debugbreak()` after `XGameRuntimeInitialize` fails | Loader steps over title debug breaks (`--break-on-int3` to disable). Game continues into `main` |
 | 5 | `GameInput!GameInputCreate` (ordinal 1) | Use Windows' own GameInput (same v0 interface) |
-| 6 | **`XCRDAPI!DStorageGetFactory`** | **Next:** a DirectStorage factory backed by file I/O on the dump |
+| 6 | `XCRDAPI!DStorageGetFactory` | Probe COM object (logs every vtable call). Game calls slot 8 (`SetStagingBufferSize(32 MB)`?) |
+| 7 | 5 asserts, then null `memset` in engine init | Game asked for `G:\appdata0.rpf`. **`G:\` (Xbox package mount) now maps to the dump folder.** `GetModuleFileName/Handle(NULL)` now report the game, not the loader |
+| 8 | Opens all 12 `.rpf` archives, calls DStorage factory slot 4 per archive (`OpenFile`?) | Probe returns `S_OK` without an object, so this needs a real file object next |
+| 9 | **`xmem!XMemAllocatePhysicalPages`** | **Next:** emulate Xbox physical pages + `XMemMapPhysicalPages` into the 24 GB reservations |
 
 Still to do:
 
 - `xmem.dll`: physical-page APIs, `XMemTransferMemory`
+- DirectStorage: real `OpenFile` / queue / request objects reading from the `.rpf` files
 - `xgameruntime.dll` stand-in (XUser, XTaskQueue, XGameSave, ...). `XGameRuntimeInitialize` currently fails
-- File system: map Xbox package paths to the dump folder; read `.rpf` archives and `.ttpf` streaming packs
-- `GetModuleHandle(NULL)` and the PEB image base should point at the game, not the loader
+- Other Xbox mount points (persistent local storage, temp) as the logs show them
 
 ## 3. Audio and input
 

@@ -20,6 +20,9 @@ add_executable(vice-pc
   src/hle/xmem.cpp
   src/hle/vcruntime.cpp
   src/hle/d3d12_xs.cpp
+  src/hle/probe.cpp
+  src/hle/xcrdapi.cpp
+  src/hle/kernel.cpp
 )
 target_compile_definitions(vice-pc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 # /Zc:threadSafeInit-: thread-safe statics use implicit TLS, and the game owns TLS slot 0 (see src/tls.cpp).
