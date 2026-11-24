@@ -539,7 +539,12 @@ HRESULT STDMETHODCALLTYPE Device_CreateResourceAtAddressX(ID3D12Device* self, ui
     *out = nullptr;
 
     MEMORY_BASIC_INFORMATION mbi{};
-    bool cpu_backed = d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+    // Sharing title memory with the GPU is opt-in (VICEPC_SHARE_TITLE_MEMORY=1): the title
+    // unmaps / remaps its pages through XMem, which pulls memory out from under the GPU
+    // and removes the device.
+    char share[4] = "";
+    const bool share_ok = GetEnvironmentVariableA("VICEPC_SHARE_TITLE_MEMORY", share, sizeof(share)) && share[0] == '1';
+    bool cpu_backed = share_ok && d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
                       VirtualQuery(reinterpret_cast<void*>(game_va), &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT;
     if (cpu_backed) {
         // Title memory is ordinary committed memory here: let the GPU see it directly.
@@ -563,6 +568,13 @@ HRESULT STDMETHODCALLTYPE Device_CreateResourceAtAddressX(ID3D12Device* self, ui
                                        clear,
                                        __uuidof(ID3D12Resource), out);
         how = "GPU-only";
+    }
+    if (hr == DXGI_ERROR_DEVICE_REMOVED) {
+        static bool told = false;
+        if (!told) {
+            told = true;
+            LOG("[d3d12] DEVICE REMOVED, reason 0x%08lx", self->GetDeviceRemovedReason());
+        }
     }
     LOG("[d3d12] CreateResourceAtAddressX(va=0x%llx dim=%d %llux%u fmt=%d flags=0x%x state=0x%x) -> 0x%08lx, %s",
         (unsigned long long)game_va, xdesc->Dimension, (unsigned long long)xdesc->Width, xdesc->Height, xdesc->Format,

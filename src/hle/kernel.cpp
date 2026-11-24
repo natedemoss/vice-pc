@@ -38,6 +38,21 @@ std::wstring translate(const wchar_t* path) {
         out += path + 3;
         return out;
     }
+    // Title storage drives: T:\ (temp), S:\ and D:\ (persistent / scratch). Map each to
+    // %LOCALAPPDATA%\vice-pc\<letter>, created on first use.
+    wchar_t drive = static_cast<wchar_t>(towupper(path[0]));
+    if ((drive == L'T' || drive == L'S' || drive == L'D') && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+        wchar_t base[MAX_PATH];
+        DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+        if (n && n < MAX_PATH) {
+            std::wstring dir = std::wstring(base) + L"\\vice-pc";
+            CreateDirectoryW(dir.c_str(), nullptr);
+            dir += L'\\';
+            dir += drive;
+            CreateDirectoryW(dir.c_str(), nullptr);
+            return dir + L"\\" + (path + 3);
+        }
+    }
     return path;
 }
 

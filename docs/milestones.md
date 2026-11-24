@@ -52,7 +52,22 @@ Each run of `--stop-on-stub` gets further. Stops so far, in order:
 | 23 | Init skipped: `CreateCommandSignature` rejected (mesh dispatch) | Falls back to compute dispatch on GPUs without mesh shaders |
 | 24 | Texture objects corrupted | Hardware watchpoint caught it: the title calls some struct-returning methods C++-style and others C-style. Thunk now detects which per call |
 | 25 | Null frame context | Stack corruption: Xbox queue slot 18 is `GetTimestampFrequency`, PC slot 18 is `GetDesc` (16 bytes into an 8-byte variable) |
-| 26 | **Main loop starting: render targets (2560×1440), hundreds of textures, worker threads running; next crash in render setup** | **Current** |
+| 26 | GPU device removed | Xbox queue slots 16-19 are PC 14-17 (`Signal` was overwriting fences); texture views reinterpreting formats; buffers placed over title memory the title later remaps. All fixed (sharing title memory is now opt-in) |
+| 27 | Pipeline caches full of nulls | Xbox pipeline creators (device slots 55/57/62/67) return a placeholder pipeline. The title builds its whole library (16,000+ pipelines) |
+| 28 | Title scribbles over PC command-list objects | **Xbox command lists are user-mode GPU packet buffers** the title writes into inline. Title lists are now title-owned buffers (packets kept, not decoded yet) |
+| 29 | Fence completed-value pointer, audio processor (AcpHal), `GetResourceAllocationInfo` | Fence value mirror thread; APU heap + shape contexts; allocation info with sanitised descs |
+| 30 | **Game-side null in engine setup (`game+0xcc24a0`), no D3D12 failures** | **Current** |
+
+### What the loading screen still needs
+
+The title now gets through device, memory, streaming, pipeline and audio setup without
+the PC runtime rejecting anything. Nothing is drawn because two big pieces don't exist yet:
+
+1. **GPU command processor**: decode the packets the title writes into its command lists
+   and replay them as PC D3D12 work (the Xbox driver does this in user mode).
+2. **Shader translation**: turn the console pipelines (RDNA2 machine code) into DXIL.
+
+Both are large, research-level projects.
 
 ### Why D3D12 works at all
 
