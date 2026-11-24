@@ -87,6 +87,22 @@ HRESULT STDMETHODCALLTYPE Queue_GetTimestampFrequencyX(ID3D12CommandQueue* self,
     return orig<Fn>(self, 16)(self, freq);
 }
 
+// Xbox ID3D12CommandQueue has two extra methods before Signal: Xbox slots 16..20 are
+// PC slots 14..18 (Signal, Wait, GetTimestampFrequency, GetClockCalibration, GetDesc).
+// Reference title: slot 16 called as (fence, value) at game+0x2482608.
+HRESULT STDMETHODCALLTYPE Queue_SignalX(ID3D12CommandQueue* self, ID3D12Fence* fence, UINT64 value) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+    return orig<Fn>(self, 14)(self, fence, value);
+}
+HRESULT STDMETHODCALLTYPE Queue_WaitX(ID3D12CommandQueue* self, ID3D12Fence* fence, UINT64 value) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+    return orig<Fn>(self, 15)(self, fence, value);
+}
+HRESULT STDMETHODCALLTYPE Queue_GetClockCalibrationX(ID3D12CommandQueue* self, UINT64* gpu, UINT64* cpu) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT64*, UINT64*);
+    return orig<Fn>(self, 17)(self, gpu, cpu);
+}
+
 HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3D12_COMMAND_QUEUE_DESC* desc,
                                                     REFIID, void** out) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
@@ -99,7 +115,10 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3
             desc->Flags, hr);
     if (SUCCEEDED(hr)) {
         vt_patch(*out, kVtCommandQueue);
+        vt_override(*out, 16, reinterpret_cast<void*>(&Queue_SignalX));
+        vt_override(*out, 17, reinterpret_cast<void*>(&Queue_WaitX));
         vt_override(*out, 18, reinterpret_cast<void*>(&Queue_GetTimestampFrequencyX));
+        vt_override(*out, 19, reinterpret_cast<void*>(&Queue_GetClockCalibrationX));
     }
     return hr;
 }
@@ -356,6 +375,75 @@ void STDMETHODCALLTYPE Device_CreateSRVAtAddressX(ID3D12Device* self, const D3D1
             res = nullptr;
         }
         if (res && res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) res = nullptr;
+        if (res) {
+            // Xbox lets a view reinterpret a texture's format freely; PC does not (an invalid
+            // view removes the device). Use a format the real texture accepts and clamp mips.
+            D3D12_RESOURCE_DESC rd = res->GetDesc();
+            DXGI_FORMAT f = rd.Format;
+            switch (f) {
+                case DXGI_FORMAT_D32_FLOAT: f = DXGI_FORMAT_R32_FLOAT; break;
+                case DXGI_FORMAT_D24_UNORM_S8_UINT: f = DXGI_FORMAT_R24_UNORM_X8_TYPELESS; break;
+                case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: f = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; break;
+                case DXGI_FORMAT_D16_UNORM: f = DXGI_FORMAT_R16_UNORM; break;
+                default: break;
+            }
+            static const DXGI_FORMAT kTypeless[] = {
+                DXGI_FORMAT_R32G32B32A32_TYPELESS, DXGI_FORMAT_R32G32B32_TYPELESS, DXGI_FORMAT_R16G16B16A16_TYPELESS,
+                DXGI_FORMAT_R32G32_TYPELESS, DXGI_FORMAT_R10G10B10A2_TYPELESS, DXGI_FORMAT_R8G8B8A8_TYPELESS,
+                DXGI_FORMAT_R16G16_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R8G8_TYPELESS,
+                DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R8_TYPELESS, DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC2_TYPELESS,
+                DXGI_FORMAT_BC3_TYPELESS, DXGI_FORMAT_BC4_TYPELESS, DXGI_FORMAT_BC5_TYPELESS,
+                DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_BC6H_TYPELESS,
+                DXGI_FORMAT_BC7_TYPELESS};
+            bool typeless = false;
+            for (DXGI_FORMAT t : kTypeless) typeless |= (t == rd.Format);
+            if (typeless) f = d.Format;  // the title's typed format is (most likely) in the same family
+            if (d.Format != f) {
+                static std::atomic<int> nf{0};
+                if (nf.fetch_add(1) < 20)
+                    LOG("[d3d12]   SRVAtAddressX: view format %d on texture format %d -> using %d", d.Format, rd.Format, f);
+                d.Format = f;
+            }
+            const UINT mips = rd.MipLevels ? rd.MipLevels : 1;
+            switch (d.ViewDimension) {
+                case D3D12_SRV_DIMENSION_TEXTURE2D:
+                    if (rd.DepthOrArraySize > 1) {
+                        d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                        d.Texture2DArray = {d.Texture2D.MostDetailedMip, d.Texture2D.MipLevels, 0, rd.DepthOrArraySize,
+                                            0, d.Texture2D.ResourceMinLODClamp};
+                    }
+                    if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D) {
+                        d.Texture2D.PlaneSlice = 0;
+                        if (d.Texture2D.MostDetailedMip >= mips) d.Texture2D.MostDetailedMip = 0;
+                        d.Texture2D.MipLevels = UINT(-1);
+                        break;
+                    }
+                    [[fallthrough]];
+                case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+                    d.Texture2DArray.PlaneSlice = 0;
+                    if (d.Texture2DArray.MostDetailedMip >= mips) d.Texture2DArray.MostDetailedMip = 0;
+                    d.Texture2DArray.MipLevels = UINT(-1);
+                    if (d.Texture2DArray.FirstArraySlice >= rd.DepthOrArraySize) d.Texture2DArray.FirstArraySlice = 0;
+                    d.Texture2DArray.ArraySize = rd.DepthOrArraySize - d.Texture2DArray.FirstArraySlice;
+                    break;
+                case D3D12_SRV_DIMENSION_TEXTURE3D:
+                    if (rd.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D) res = nullptr;
+                    else { d.Texture3D.MostDetailedMip = 0; d.Texture3D.MipLevels = UINT(-1); }
+                    break;
+                case D3D12_SRV_DIMENSION_TEXTURECUBE:
+                case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+                    if (rd.DepthOrArraySize < 6) res = nullptr;
+                    else if (d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURECUBE) { d.TextureCube.MostDetailedMip = 0; d.TextureCube.MipLevels = UINT(-1); }
+                    else { d.TextureCubeArray.MostDetailedMip = 0; d.TextureCubeArray.MipLevels = UINT(-1);
+                           d.TextureCubeArray.First2DArrayFace = 0; d.TextureCubeArray.NumCubes = rd.DepthOrArraySize / 6; }
+                    break;
+                default:
+                    res = nullptr;  // other dimensions: null view until needed
+                    break;
+            }
+            // Formats with no valid SRV (typeless that we can't resolve): null view.
+            if (res && (d.Format == DXGI_FORMAT_UNKNOWN)) res = nullptr;
+        }
     }
     if (g_srvx_logged.fetch_add(1) < 50)
         LOG("[d3d12] CreateSRVAtAddressX(va=0x%llx dim=%d fmt=%d n=%u width=%llu) -> %s", (unsigned long long)x->gpu_va,
@@ -675,16 +763,71 @@ HRESULT STDMETHODCALLTYPE Device_CreatePipelineState(ID3D12Device* self, const D
 // The blob holds console GPU code, which PC D3D12 cannot run: fail cleanly (the title
 // checks the HRESULT and carries on without that pipeline).
 std::atomic<int> g_pso_x_logged{0};
-HRESULT STDMETHODCALLTYPE Device_CreatePipelineStateX(ID3D12Device*, const uint64_t* desc, uint64_t a2, uint64_t a3,
-                                                      REFIID, void** out) {
+std::atomic<uint64_t> g_placeholder_psos{0};
+
+// Placeholder pipeline: an empty compute shader with an empty root signature. The title
+// caches pipelines and dereferences them later, so handing back nothing crashes its
+// workers. Until console shaders are translated, every console pipeline maps to this
+// (nothing it records will render correctly).
+using D3DCompileFn = HRESULT(WINAPI*)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*,
+                                      UINT, UINT, ID3DBlob**, ID3DBlob**);
+
+HRESULT create_placeholder_pso(ID3D12Device* dev, void** out) {
+    static ID3D12RootSignature* rs = nullptr;
+    static ID3DBlob* cs = nullptr;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    if (!cs) {
+        HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+        auto compile = m ? reinterpret_cast<D3DCompileFn>(GetProcAddress(m, "D3DCompile")) : nullptr;
+        if (!compile) return E_NOTIMPL;
+        const char src[] = "[numthreads(1,1,1)] void main() {}";
+        ID3DBlob* err = nullptr;
+        HRESULT hr = compile(src, sizeof(src) - 1, "vicepc_placeholder", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err);
+        if (err) err->Release();
+        if (FAILED(hr)) { cs = nullptr; return hr; }
+        D3D12_ROOT_SIGNATURE_DESC rd{};
+        ID3DBlob* blob = nullptr;
+        hr = D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &blob, nullptr);
+        if (FAILED(hr)) return hr;
+        using RsFn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, UINT, const void*, SIZE_T, REFIID, void**);
+        hr = orig<RsFn>(dev, 16)(dev, 0, blob->GetBufferPointer(), blob->GetBufferSize(), __uuidof(ID3D12RootSignature),
+                                 reinterpret_cast<void**>(&rs));
+        blob->Release();
+        if (FAILED(hr)) return hr;
+        LOG("[d3d12] placeholder pipeline ready (empty compute shader)");
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = rs;
+    pd.CS = {cs->GetBufferPointer(), cs->GetBufferSize()};
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMPUTE_PIPELINE_STATE_DESC*, REFIID, void**);
+    HRESULT hr = orig<Fn>(dev, 11)(dev, &pd, __uuidof(ID3D12PipelineState), out);
+    if (SUCCEEDED(hr)) vt_patch(*out, kVtPipelineState);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Device_CreatePipelineStateX(ID3D12Device* self, const uint64_t* desc, uint64_t a2,
+                                                      uint64_t a3, REFIID, void** out) {
+    if (out) *out = nullptr;
+    HRESULT hr = out ? create_placeholder_pso(self, out) : E_POINTER;
+    uint64_t total = g_placeholder_psos.fetch_add(1) + 1;
     int n = g_pso_x_logged.fetch_add(1);
     if (n < 8 && desc)
-        LOG("[d3d12] CreatePipelineStateX(desc={%llx %llx %llx %llx}, %llx, %llx) -> E_NOTIMPL (console pipeline blob)",
+        LOG("[d3d12] CreatePipelineStateX(desc={%llx %llx %llx %llx}, %llx, %llx) -> 0x%08lx (placeholder: console "
+            "shaders not translated)",
             (unsigned long long)desc[0], (unsigned long long)desc[1], (unsigned long long)desc[2],
-            (unsigned long long)desc[3], (unsigned long long)a2, (unsigned long long)a3);
-    else if (n == 8) LOG("[d3d12] CreatePipelineStateX: further calls not logged");
-    if (out) *out = nullptr;
-    return E_NOTIMPL;
+            (unsigned long long)desc[3], (unsigned long long)a2, (unsigned long long)a3, hr);
+    else if ((total & (total - 1)) == 0)
+        LOG("[d3d12] CreatePipelineStateX: %llu console pipelines so far (all placeholders)", (unsigned long long)total);
+    return hr;
+}
+
+// Xbox-only device slots 57 and 67: pipeline from a description, 3-argument form
+// (desc, IID_ID3D12PipelineState, out). Reference title: game+0x2477578 (fills the
+// pipeline cache the render workers read) and game+0x24800d5.
+HRESULT STDMETHODCALLTYPE Device_CreatePipelineStateX3(ID3D12Device* self, const uint64_t* desc, REFIID riid,
+                                                       void** out) {
+    return Device_CreatePipelineStateX(self, desc, 0, 0, riid, out);
 }
 
 HRESULT STDMETHODCALLTYPE Device_CheckFeatureSupport(ID3D12Device* self, D3D12_FEATURE f, void* data, UINT size) {
@@ -770,7 +913,10 @@ HRESULT d3d12_create_title_device(void** out) {
     // Xbox device layout diverges from PC after the core methods:
     OV(48, Device_CreateCommandQueue);   // Xbox CreateCommandQueue variant (desc, riid, out)
     OV(73, Device_CreateCommandListX);   // Xbox CreateCommandList(desc*, alloc, pso, riid, out)
+    OV(55, Device_CreatePipelineStateX);  // Xbox: PSO from state description (game+0x247a5c2), same shape
     OV(62, Device_CreatePipelineStateX);  // Xbox: PSO from a precompiled console blob
+    OV(57, Device_CreatePipelineStateX3);  // Xbox: PSO from desc (3-arg form)
+    OV(67, Device_CreatePipelineStateX3);
     OV(70, Device_CreateSRVAtAddressX);    // Xbox: buffer SRV from a GPU VA
     OV(133, Device_CreateResourceAtAddressX);  // Xbox: resource at a title-chosen GPU VA
     OV(17, Device_CreateCBV);
