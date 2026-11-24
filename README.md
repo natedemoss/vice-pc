@@ -43,6 +43,9 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
+If the build fails with `FTK1011` errors, your folder path is too long for
+MSBuild. Clone to a short path (e.g. `C:\src\vice-pc`) or pass a short `-B` build folder.
+
 The tests run a small stand-in "game" (`tests/fake_game.cpp`) through the
 loader. It checks TLS on several threads, C++ exceptions and import stubbing.
 

@@ -13,6 +13,10 @@ struct HleExport {
 void* hle_lookup(const char* dll_lower, const char* name);
 void hle_register(const HleExport* table, int count);
 
+// Base address of the mapped game image (set by the loader before imports are resolved).
+void hle_set_image_base(void* base);
+void* hle_image_base();
+
 // Registers a table at static-init time.
 struct HleRegistrar {
     template <int N>

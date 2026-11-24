@@ -1,6 +1,7 @@
 // Vice PC — milestone 1: map an Xbox Series (GDK) title executable into a
 // Windows process, satisfy what Windows can, stub/log everything Xbox-only, and run it.
 
+#include "hle/hle.h"
 #include "log.h"
 #include "pe_loader.h"
 #include "stubs.h"
@@ -101,7 +102,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--stop-on-stub") opt.stop_on_stub = true;
         else if (a == L"--stub-dll" && i + 1 < argc) {
             std::wstring w = argv[++i];
-            std::string s(w.begin(), w.end());
+            std::string s;
+            for (wchar_t wc : w) s.push_back(static_cast<char>(wc));  // DLL names are ASCII
             for (auto& ch : s) ch = (char)tolower((unsigned char)ch);
             opt.stub_dlls.push_back(s);
         } else if (a == L"--root" && i + 1 < argc) root_arg = argv[++i];
@@ -122,6 +124,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (!pe_map(exe.wstring(), g_img)) return 2;
     stub_set_image_range(g_img.base, g_img.size);
+    hle_set_image_base(g_img.base);
 
     ImportStats st;
     if (!pe_resolve_imports(g_img, opt, st)) return 2;

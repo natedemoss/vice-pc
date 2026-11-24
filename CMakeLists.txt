@@ -18,6 +18,7 @@ add_executable(vice-pc
   src/tls.cpp
   src/hle/hle.cpp
   src/hle/xmem.cpp
+  src/hle/vcruntime.cpp
 )
 target_compile_definitions(vice-pc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 target_compile_options(vice-pc PRIVATE /W4 /permissive-)

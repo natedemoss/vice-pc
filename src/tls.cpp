@@ -25,6 +25,14 @@ size_t g_zero_fill = 0;
 void* g_image_base = nullptr;
 std::vector<PIMAGE_TLS_CALLBACK> g_callbacks;
 
+// Per-thread bookkeeping (the host's own implicit TLS, set up by the OS loader).
+// Windows 10+ keeps a hidden header in front of the TLS array it allocates and
+// frees the array through that header at thread exit, so we must hand the
+// original array back before ntdll tears the thread down.
+thread_local void** t_original_array = nullptr;
+thread_local void** t_our_array = nullptr;
+thread_local void* t_our_block = nullptr;
+
 void** teb_tls_array() {
     return *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(NtCurrentTeb()) + kTebTlsPointer);
 }
@@ -69,9 +77,20 @@ bool install_for_current_thread() {
     }
     memcpy(block, g_template, g_template_size);
     arr[g_slot] = block;
+    t_original_array = old;
+    t_our_array = arr;
+    t_our_block = block;
     set_teb_tls_array(arr);
-    // The old array is intentionally leaked; ntdll frees the array the TEB points to at thread exit.
     return true;
+}
+
+void restore_current_thread() {
+    if (!t_our_array) return;
+    if (teb_tls_array() == t_our_array) set_teb_tls_array(t_original_array);
+    HeapFree(GetProcessHeap(), 0, t_our_array);
+    HeapFree(GetProcessHeap(), 0, t_our_block);
+    t_our_array = nullptr;
+    t_our_block = nullptr;
 }
 
 void run_callbacks(DWORD reason) {
@@ -83,6 +102,7 @@ void NTAPI host_tls_callback(PVOID, DWORD reason, PVOID) {
     if (reason == DLL_PROCESS_DETACH) {
         stub_print_summary();
         log_flush();
+        if (g_ready.load()) restore_current_thread();
         return;
     }
     if (!g_ready.load()) return;
@@ -91,6 +111,7 @@ void NTAPI host_tls_callback(PVOID, DWORD reason, PVOID) {
         run_callbacks(DLL_THREAD_ATTACH);
     } else if (reason == DLL_THREAD_DETACH) {
         run_callbacks(DLL_THREAD_DETACH);
+        restore_current_thread();
     }
 }
 
