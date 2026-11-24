@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="392" viewBox="0 0 860 392" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    :root { --bg:#ffffff; --border:#d1d9e0; --fg:#1f2328; --muted:#59636e; --track:#eaeef2; --done:#1a7f37; --wip:#0969da; --todo:#8c959f; --no-bg:#ffebe9; --no-fg:#cf222e; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#0d1117; --border:#3d444d; --fg:#e6edf3; --muted:#9198a1; --track:#21262d; --done:#3fb950; --wip:#4493f8; --todo:#656c76; --no-bg:#3c1618; --no-fg:#ff7b72; }
+    }
+    .bg { fill: var(--bg); stroke: var(--border); }
+    .title { fill: var(--fg); font-size: 20px; font-weight: 600; }
+    .sub { fill: var(--muted); font-size: 13px; }
+    .label { fill: var(--fg); font-size: 15px; font-weight: 600; }
+    .desc { fill: var(--muted); font-size: 12px; }
+    .pct { fill: var(--fg); font-size: 14px; font-weight: 600; font-variant-numeric: tabular-nums; }
+    .track { fill: var(--track); }
+    .done { fill: var(--done); }
+    .wip { fill: var(--wip); }
+    .num { fill: var(--bg); font-size: 12px; font-weight: 700; }
+    .dot-wip { fill: var(--wip); }
+    .dot-todo { fill: var(--todo); }
+    .flag { fill: var(--wip); font-size: 11px; font-weight: 600; }
+    .pill { fill: var(--no-bg); }
+    .pill-t { fill: var(--no-fg); font-size: 12px; font-weight: 600; }
+    .foot { fill: var(--muted); font-size: 11px; }
+  </style>
+
+  <rect class="bg" x="0.5" y="0.5" width="859" height="391" rx="12"/>
+
+  <text class="title" x="28" y="42">Vice PC · boot progress</text>
+  <text class="sub" x="28" y="63">Xbox Series title → Windows PC · reference target: package v1.0.2.1</text>
+
+  <!-- Row 1: Loader -->
+  <circle class="dot-wip" cx="40" cy="102" r="12"/><text class="num" x="40" y="106" text-anchor="middle">1</text>
+  <text class="label" x="64" y="100">Loader</text>
+  <text class="desc" x="64" y="117">Map exe · link imports · TLS · unwind · crash log</text>
+  <rect class="track" x="380" y="96" width="400" height="12" rx="6"/>
+  <rect class="wip" x="380" y="96" width="343" height="12" rx="6"/>
+  <text class="pct" x="832" y="107" text-anchor="end">86%</text>
+
+  <!-- Row 2: Boot -->
+  <circle class="dot-todo" cx="40" cy="152" r="12"/><text class="num" x="40" y="156" text-anchor="middle">2</text>
+  <text class="label" x="64" y="150">Boot to main loop</text>
+  <text class="desc" x="64" y="167">xmem (4/12) · RPF / TTPF files · DirectStorage</text>
+  <rect class="track" x="380" y="146" width="400" height="12" rx="6"/>
+  <rect class="wip" x="380" y="146" width="40" height="12" rx="6"/>
+  <text class="pct" x="832" y="157" text-anchor="end">10%</text>
+
+  <!-- Row 3: Audio & input -->
+  <circle class="dot-todo" cx="40" cy="202" r="12"/><text class="num" x="40" y="206" text-anchor="middle">3</text>
+  <text class="label" x="64" y="200">Audio &amp; input</text>
+  <text class="desc" x="64" y="217">XApu / AcpHal → XAudio2 · GameInput · Bink video</text>
+  <rect class="track" x="380" y="196" width="400" height="12" rx="6"/>
+  <text class="pct" x="832" y="207" text-anchor="end">0%</text>
+
+  <!-- Row 4: Graphics -->
+  <circle class="dot-todo" cx="40" cy="252" r="12"/><text class="num" x="40" y="256" text-anchor="middle">4</text>
+  <text class="label" x="64" y="250">Graphics</text>
+  <text class="desc" x="64" y="267">Xbox D3D12 → PC D3D12 · console shader translation</text>
+  <rect class="track" x="380" y="246" width="400" height="12" rx="6"/>
+  <text class="flag" x="380" y="240">▼ first pixels / loading screen</text>
+  <text class="pct" x="832" y="257" text-anchor="end">0%</text>
+
+  <!-- Row 5: Online -->
+  <circle class="dot-todo" cx="40" cy="302" r="12"/><text class="num" x="40" y="306" text-anchor="middle">5</text>
+  <text class="label" x="64" y="300">Online</text>
+  <text class="desc" x="64" y="317">libHttpClient · XCurl · offline mode</text>
+  <rect class="track" x="380" y="296" width="400" height="12" rx="6"/>
+  <text class="pct" x="832" y="307" text-anchor="end">0%</text>
+
+  <!-- Status pills -->
+  <rect class="pill" x="28" y="340" width="96" height="26" rx="13"/><text class="pill-t" x="76" y="357" text-anchor="middle">Boots ✗</text>
+  <rect class="pill" x="132" y="340" width="138" height="26" rx="13"/><text class="pill-t" x="201" y="357" text-anchor="middle">Loading screen ✗</text>
+  <rect class="pill" x="278" y="340" width="104" height="26" rx="13"/><text class="pill-t" x="330" y="357" text-anchor="middle">Playable ✗</text>
+  <text class="foot" x="832" y="357" text-anchor="end">Updated 2026-11-24</text>
+</svg>

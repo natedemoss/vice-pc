@@ -1,0 +1,19 @@
+# Build output
+build/
+out/
+*.log
+
+# Never commit game content. Bring your own dump.
+*.exe
+*.dll
+*.rpf
+*.ttpf
+*.xvd
+*.bin
+*.pri
+*.alignmentchunk
+MicrosoftGame.Config
+appxmanifest.xml
+layout_*.xml
+game/
+dump/

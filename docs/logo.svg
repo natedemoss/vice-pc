@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="240" viewBox="0 0 860 240">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#140b2e"/>
+      <stop offset="0.55" stop-color="#3a1452"/>
+      <stop offset="1" stop-color="#7a1f5c"/>
+    </linearGradient>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a1a5e"/>
+      <stop offset="1" stop-color="#0b2a44"/>
+    </linearGradient>
+    <linearGradient id="sun" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe27a"/>
+      <stop offset="0.5" stop-color="#ff8a5c"/>
+      <stop offset="1" stop-color="#ff3d8b"/>
+    </linearGradient>
+    <linearGradient id="word" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7ff6ff"/>
+      <stop offset="0.5" stop-color="#ff7ad9"/>
+      <stop offset="1" stop-color="#ff3d8b"/>
+    </linearGradient>
+    <mask id="sunStripes">
+      <rect x="0" y="0" width="860" height="240" fill="#fff"/>
+      <rect x="0" y="146" width="860" height="4" fill="#000"/>
+      <rect x="0" y="158" width="860" height="5" fill="#000"/>
+      <rect x="0" y="170" width="860" height="6" fill="#000"/>
+      <rect x="0" y="182" width="860" height="8" fill="#000"/>
+    </mask>
+    <clipPath id="frame"><rect x="0" y="0" width="860" height="240" rx="18"/></clipPath>
+    <!-- one palm frond, pointing right from the crown -->
+    <path id="frond" d="M0 0 C 22 -16, 52 -14, 78 8 C 60 -2, 40 -2, 26 2 L 34 10 L 20 5 L 24 14 L 12 6 L 12 12 Z"/>
+    <filter id="glow" x="-20%" y="-40%" width="140%" height="180%">
+      <feGaussianBlur stdDeviation="6" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="860" height="240" fill="url(#sky)"/>
+    <!-- stars -->
+    <g fill="#fff" opacity="0.7">
+      <circle cx="40" cy="30" r="1.2"/><circle cx="120" cy="18" r="1"/><circle cx="300" cy="26" r="1.1"/>
+      <circle cx="420" cy="14" r="0.9"/><circle cx="560" cy="34" r="1.2"/><circle cx="700" cy="20" r="1"/>
+      <circle cx="810" cy="40" r="1.3"/><circle cx="640" cy="60" r="0.8"/><circle cx="250" cy="62" r="0.8"/>
+    </g>
+
+    <!-- sun -->
+    <circle cx="170" cy="150" r="86" fill="url(#sun)" mask="url(#sunStripes)" filter="url(#glow)"/>
+
+    <!-- sea + horizon -->
+    <rect x="0" y="194" width="860" height="46" fill="url(#sea)"/>
+    <rect x="0" y="193" width="860" height="2" fill="#ff7ad9" opacity="0.8"/>
+    <g fill="#ff8a5c" opacity="0.55">
+      <rect x="120" y="204" width="100" height="2" rx="1"/>
+      <rect x="135" y="214" width="70" height="2" rx="1"/>
+      <rect x="150" y="224" width="40" height="2" rx="1"/>
+    </g>
+
+    <!-- palm silhouette -->
+    <g fill="#12071f">
+      <path d="M246 196 C 244 160, 236 120, 214 86 L 220 84 C 244 118, 254 158, 256 196 Z"/>
+      <g transform="translate(216 84)">
+        <use href="#frond" transform="rotate(-8)"/>
+        <use href="#frond" transform="rotate(28) scale(0.9)"/>
+        <use href="#frond" transform="rotate(-40) scale(0.8)"/>
+        <use href="#frond" transform="scale(-1 1) rotate(-4)"/>
+        <use href="#frond" transform="scale(-1 1) rotate(30) scale(0.85)"/>
+        <use href="#frond" transform="scale(-1 1) rotate(-38) scale(0.75)"/>
+        <circle r="6"/>
+      </g>
+    </g>
+
+    <!-- wordmark -->
+    <text x="318" y="128" font-family="'Arial Black', 'Segoe UI Black', Impact, sans-serif" font-weight="900"
+          font-style="italic" font-size="92" letter-spacing="2" fill="url(#word)" filter="url(#glow)">VICE PC</text>
+    <text x="324" y="168" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="18" letter-spacing="4"
+          fill="#c9d4ff" opacity="0.9">XBOX SERIES → WINDOWS PC LOADER</text>
+  </g>
+</svg>
