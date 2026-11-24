@@ -104,6 +104,47 @@ HRESULT STDMETHODCALLTYPE Queue_GetClockCalibrationX(ID3D12CommandQueue* self, U
     return orig<Fn>(self, 17)(self, gpu, cpu);
 }
 
+// Xbox queue submission (slots 32 and 35). Reference title: slot 32 (count, lists, ...)
+// at game+0x24824c1; slot 35 (count, lists, sync, flags) at game+0x2482689. Packets are
+// not executed yet; the first submissions are dumped so the packet format can be decoded.
+std::atomic<int> g_submit_dumps{0};
+std::atomic<uint64_t> g_submits{0};
+
+void dump_submission(const char* which, uint32_t count, void* const* lists) {
+    uint64_t n = g_submits.fetch_add(1) + 1;
+    if ((n & (n - 1)) == 0) LOG("[d3d12] %s: %llu submissions so far (packets not executed)", which, (unsigned long long)n);
+    if (!lists || count > 64) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t* p;
+        size_t dw;
+        if (!cmdlist_title_packets(lists[i], &p, &dw) || dw == 0) continue;
+        if (g_submit_dumps.fetch_add(1) >= 6) return;
+        LOG("[pm4] %s list %u: %zu dwords", which, i, dw);
+        char line[256];
+        for (size_t off = 0; off < dw && off < 96; off += 8) {
+            size_t len = 0;
+            for (size_t k = off; k < off + 8 && k < dw; ++k) len += snprintf(line + len, sizeof(line) - len, "%08x ", p[k]);
+            LOG("[pm4]   %04zx: %s", off, line);
+        }
+    }
+}
+
+HRESULT STDMETHODCALLTYPE Queue_SubmitX32(ID3D12CommandQueue*, uint32_t count, void* const* lists, void*) {
+    dump_submission("queue slot32", count, lists);
+    return S_OK;
+}
+HRESULT STDMETHODCALLTYPE Queue_SubmitX35(ID3D12CommandQueue*, uint32_t count, void* const* lists, void* sync,
+                                          uint32_t flags) {
+    static std::atomic<int> raw{0};
+    if (raw.fetch_add(1) < 6) {
+        void* l0 = lists ? lists[0] : nullptr;
+        LOG("[d3d12] slot35 raw: count=%u lists=%p lists[0]=%p vptr=%p sync=%p flags=0x%x from %p", count, lists, l0,
+            l0 ? *static_cast<void**>(l0) : nullptr, sync, flags, CALLER);
+    }
+    dump_submission("queue slot35", count, lists);
+    return S_OK;
+}
+
 HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3D12_COMMAND_QUEUE_DESC* desc,
                                                     REFIID, void** out) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_QUEUE_DESC*, REFIID, void**);
@@ -120,6 +161,8 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandQueue(ID3D12Device* self, const D3
         vt_override(*out, 17, reinterpret_cast<void*>(&Queue_WaitX));
         vt_override(*out, 18, reinterpret_cast<void*>(&Queue_GetTimestampFrequencyX));
         vt_override(*out, 19, reinterpret_cast<void*>(&Queue_GetClockCalibrationX));
+        vt_override(*out, 32, reinterpret_cast<void*>(&Queue_SubmitX32));
+        vt_override(*out, 35, reinterpret_cast<void*>(&Queue_SubmitX35));
     }
     return hr;
 }

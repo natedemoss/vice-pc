@@ -116,7 +116,7 @@ struct FakeList {
     void** vtbl;
 };
 
-uint8_t* fake_buf(FakeList* l) { return *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(l) + 0x10); }
+uint8_t* fake_buf(FakeList* l) { return reinterpret_cast<uint8_t*>(l) + kFakeBody; }
 void fake_rewind(FakeList* l) {
     auto* o = reinterpret_cast<uint8_t*>(l);
     uint8_t* b = fake_buf(l);
@@ -165,6 +165,21 @@ void** fake_vtable() {
 }
 
 }  // namespace
+
+bool cmdlist_title_packets(void* list, const uint32_t** start, size_t* dwords) {
+    if (!list || *static_cast<void***>(list) != fake_vtable()) return false;
+    auto* o = static_cast<uint8_t*>(list);
+    uint8_t* b = o + kFakeBody;  // the title may reuse +0x10, so use the fixed buffer location
+    uint8_t* cur = *reinterpret_cast<uint8_t**>(o + 0x18);
+    *start = reinterpret_cast<const uint32_t*>(b);
+    *dwords = (cur > b && cur < b + kFakePackets) ? static_cast<size_t>(cur - b) / 4 : 0;
+    static std::atomic<int> logged{0};
+    if (*dwords == 0 && logged.fetch_add(1) < 4)
+        LOG("[pm4] list %p: +0x10=%p +0x18=%p +0x20=%p +0x28=%p +0x30=%p (buffer %p)", list,
+            *reinterpret_cast<void**>(o + 0x10), cur, *reinterpret_cast<void**>(o + 0x20),
+            *reinterpret_cast<void**>(o + 0x28), *reinterpret_cast<void**>(o + 0x30), b);
+    return true;
+}
 
 void* cmdlist_create_title_list(int type) {
     auto* o = static_cast<uint8_t*>(VirtualAlloc(nullptr, kFakeBody + kFakePackets, MEM_RESERVE | MEM_COMMIT,

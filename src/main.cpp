@@ -49,6 +49,38 @@ void usage() {
 }
 
 bool g_skip_int3 = true;
+
+// For title asserts: print any register / stack slot that points at a readable string
+// (asset names, assert messages), so the log says what the title was looking for.
+bool printable_at(const void* p, char* out, size_t cap) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!p || !VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+        return false;
+    auto* s = static_cast<const char*>(p);
+    size_t avail = static_cast<const char*>(mbi.BaseAddress) + mbi.RegionSize - s;
+    size_t i = 0;
+    for (; i < cap - 1 && i < avail; ++i) {
+        char c = s[i];
+        if (c == 0) break;
+        if (c < 0x20 || c > 0x7e) return false;
+        out[i] = c;
+    }
+    out[i] = 0;
+    return i >= 4;
+}
+
+void log_string_args(const CONTEXT& c) {
+    const DWORD64 regs[] = {c.Rcx, c.Rdx, c.R8, c.R9, c.Rbx, c.Rsi, c.Rdi, c.R12, c.R13, c.R14, c.R15};
+    const char* names[] = {"rcx", "rdx", "r8", "r9", "rbx", "rsi", "rdi", "r12", "r13", "r14", "r15"};
+    char buf[160];
+    for (int i = 0; i < 11; ++i)
+        if (printable_at(reinterpret_cast<const void*>(regs[i]), buf, sizeof(buf))) LOG("        %s -> \"%s\"", names[i], buf);
+    auto* stack = reinterpret_cast<const DWORD64*>(c.Rsp);
+    for (int i = 0; i < 48; ++i)
+        if (printable_at(reinterpret_cast<const void*>(stack[i]), buf, sizeof(buf)))
+            LOG("        [rsp+%02x] -> \"%s\"", i * 8, buf);
+}
 bool g_trap_fastfail = false;
 
 // --trap-fastfail: __fastfail (int 29h) ends the process without running any exception
@@ -85,6 +117,7 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
         if (n < 16) {
             LOG("[int3] debug break at game+0x%llx, skipping", (unsigned long long)g_img.rva_of(ep->ExceptionRecord->ExceptionAddress));
             if (n < 4) print_backtrace(*ep->ContextRecord);
+            log_string_args(*ep->ContextRecord);
         }
         ep->ContextRecord->Rip += 1;
         return EXCEPTION_CONTINUE_EXECUTION;
