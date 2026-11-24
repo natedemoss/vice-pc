@@ -56,7 +56,8 @@ Each run of `--stop-on-stub` gets further. Stops so far, in order:
 | 27 | Pipeline caches full of nulls | Xbox pipeline creators (device slots 55/57/62/67) return a placeholder pipeline. The title builds its whole library (16,000+ pipelines) |
 | 28 | Title scribbles over PC command-list objects | **Xbox command lists are user-mode GPU packet buffers** the title writes into inline. Title lists are now title-owned buffers (packets kept, not decoded yet) |
 | 29 | Fence completed-value pointer, audio processor (AcpHal), `GetResourceAllocationInfo` | Fence value mirror thread; APU heap + shape contexts; allocation info with sanitised descs |
-| 30 | **Game-side null in engine setup (`game+0xcc24a0`), no D3D12 failures** | **Current** |
+| 30 | Title storage drive `T:\` missing | `T:\`, `S:\`, `D:\` map to `%LOCALAPPDATA%\vice-pc\<letter>` |
+| 31 | **Main loop running and submitting command lists (~260k submissions/min, no packets executed). A streamed asset lookup fails (title assert at `game+0xcc2834`, keyed by hash), then a null dereference** | **Current**: next step is the title's asset-streaming path (`game+0x34beb0`) |
 
 ### What the loading screen still needs
 
