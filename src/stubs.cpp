@@ -20,7 +20,8 @@ struct StubInfo {
 };
 
 // deque: stable addresses, since thunks embed a pointer to their StubInfo.
-std::deque<StubInfo> g_stubs;
+// Intentionally leaked so it outlives static destructors (the summary prints at process detach).
+std::deque<StubInfo>& g_stubs = *new std::deque<StubInfo>();
 
 const uint8_t* g_img_base = nullptr;
 size_t g_img_size = 0;
