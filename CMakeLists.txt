@@ -23,11 +23,14 @@ add_executable(vice-pc
   src/hle/probe.cpp
   src/hle/xcrdapi.cpp
   src/hle/kernel.cpp
+  src/hle/d3d12/vtpatch.cpp
+  src/hle/d3d12/device.cpp
+  src/hle/d3d12/dxgi.cpp
 )
 target_compile_definitions(vice-pc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 # /Zc:threadSafeInit-: thread-safe statics use implicit TLS, and the game owns TLS slot 0 (see src/tls.cpp).
 target_compile_options(vice-pc PRIVATE /W4 /permissive- /Zc:threadSafeInit-)
-target_link_libraries(vice-pc PRIVATE psapi)
+target_link_libraries(vice-pc PRIVATE psapi d3d12 dxgi dxguid)
 # Keep the host out of the game's preferred range (0x140000000+).
 target_link_options(vice-pc PRIVATE /BASE:0x10000000 /DYNAMICBASE:NO)
 

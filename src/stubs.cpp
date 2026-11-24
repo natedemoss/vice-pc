@@ -55,7 +55,9 @@ extern "C" uint64_t stub_handler(StubInfo* s) {
 
 uint8_t* alloc_thunk() {
     if (g_page_used == kPageThunks) {
-        g_page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        // RWX: stubs are also created while the title runs (D3D12 vtable patching), so we
+        // can't flip protections on a page other threads may be executing from.
+        g_page = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
         if (!g_page) return nullptr;
         memset(g_page, 0xCC, 4096);
         g_page_used = 0;
@@ -64,6 +66,10 @@ uint8_t* alloc_thunk() {
 }
 
 }  // namespace
+
+static bool g_stop_mode = false;
+void stub_set_stop_mode(bool stop) { g_stop_mode = stop; }
+bool stub_stop_mode() { return g_stop_mode; }
 
 void stub_set_image_range(const void* base, size_t size) {
     g_img_base = static_cast<const uint8_t*>(base);
@@ -79,10 +85,6 @@ void* stub_create(const char* dll, const char* name, bool stop_on_stub) {
     uint8_t* t = alloc_thunk();
     if (!t) return nullptr;
 
-    // Temporarily make the page writable (it may already be RX from earlier thunks).
-    DWORD old;
-    VirtualProtect(g_page, 4096, PAGE_READWRITE, &old);
-
     uint64_t info_ptr = reinterpret_cast<uint64_t>(&info);
     uint64_t handler = reinterpret_cast<uint64_t>(&stub_handler);
     uint8_t* p = t;
@@ -90,7 +92,6 @@ void* stub_create(const char* dll, const char* name, bool stop_on_stub) {
     *p++ = 0x48; *p++ = 0xB8; memcpy(p, &handler, 8); p += 8;   // mov rax, imm64
     *p++ = 0xFF; *p++ = 0xE0;                                   // jmp rax
 
-    VirtualProtect(g_page, 4096, PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), t, kThunkSize);
     return t;
 }

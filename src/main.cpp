@@ -39,6 +39,7 @@ void usage() {
         "  --no-run             map and resolve imports, print a report, do not execute\n"
         "  --stop-on-stub       stop at the first call into an unimplemented Xbox function\n"
         "  --break-on-int3      don't step over the title's __debugbreak() calls\n"
+        "  --d3d-debug          enable the D3D12 debug layer\n"
         "  --stub-dll <name>    also treat <name> as Xbox-only (repeatable)\n"
         "  --root <dir>         game package root (default: folder with MicrosoftGame.Config)\n"
         "  --log <file>         log file (default: vice-pc.log)\n");
@@ -165,6 +166,7 @@ int wmain(int argc, wchar_t** argv) {
         if (a == L"--no-run") no_run = true;
         else if (a == L"--stop-on-stub") opt.stop_on_stub = true;
         else if (a == L"--break-on-int3") g_skip_int3 = false;
+        else if (a == L"--d3d-debug") SetEnvironmentVariableW(L"VICEPC_D3D_DEBUG", L"1");
         else if (a == L"--stub-dll" && i + 1 < argc) {
             std::wstring w = argv[++i];
             std::string s;
@@ -189,6 +191,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (!pe_map(exe.wstring(), g_img)) return 2;
     stub_set_image_range(g_img.base, g_img.size);
+    stub_set_stop_mode(opt.stop_on_stub);
     hle_set_image_base(g_img.base, g_img.size);
     hle_set_game_path(exe.wstring());
     hle_set_package_root(root.wstring());

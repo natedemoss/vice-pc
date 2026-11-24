@@ -35,7 +35,40 @@ Each run of `--stop-on-stub` gets further. Stops so far, in order:
 | 6 | `XCRDAPI!DStorageGetFactory` | Probe COM object (logs every vtable call). Game calls slot 8 (`SetStagingBufferSize(32 MB)`?) |
 | 7 | 5 asserts, then null `memset` in engine init | Game asked for `G:\appdata0.rpf`. **`G:\` (Xbox package mount) now maps to the dump folder.** `GetModuleFileName/Handle(NULL)` now report the game, not the loader |
 | 8 | Opens all 12 `.rpf` archives, calls DStorage factory slot 4 per archive (`OpenFile`?) | Probe returns `S_OK` without an object, so this needs a real file object next |
-| 9 | **`xmem!XMemAllocatePhysicalPages`** | **Next:** emulate Xbox physical pages + `XMemMapPhysicalPages` into the 24 GB reservations |
+| 9 | `xmem!XMemAllocatePhysicalPages` | HLE: 64 KB page ids; `XMemMapPhysicalPages` commits/decommits at the target VA |
+| 10 | `d3d12_xs!D3D12XboxCreateDevice` | **Real PC D3D12 device** (`ID3D12Device10`) with a patched vtable (see below) |
+| 11 | Device slots 48 / 73 (Xbox-only signatures) | Xbox `CreateCommandQueue` variant and `CreateCommandList(desc*, ...)` → PC equivalents. 5 queues, 5 fences, 384 command lists created |
+| 12 | `QueryInterface(IDXGIDevice)` → `GetAdapter` → `EnumOutputs(0)` | DXGI device stand-in returning the real adapter (by LUID) |
+| 13 | `VirtualFree(MEM_PRESERVE_PLACEHOLDER)` fails | `XMemVirtualAlloc` keeps placeholder flags via `VirtualAlloc2`. 185 MB split + 2,960 physical pages mapped |
+| 14 | Crash in D3D12Core from `GetCPUDescriptorHandleForHeapStart` | **Calling convention:** title uses the C interface, so 8-byte struct returns come back in RAX |
+| 15 | **Descriptor handle assert, then a crash in the GPU driver writing a descriptor** | **Current wall** (see below) |
+
+### Why D3D12 works at all
+
+The Xbox D3D12 interfaces keep PC's method order for the core methods (device slot 26 is
+called with exactly `GetCustomHeapProperties(nodeMask=1, HEAP_TYPE_DEFAULT)`'s arguments).
+So the title talks to genuine PC D3D12 objects whose vtables are patched (`src/hle/d3d12/vtpatch.*`):
+
+- struct returns > 8 bytes: hidden pointer comes first → swap rcx/rdx (only when the caller is game code)
+- 8-byte struct returns (descriptor handles, LUID): returned in RAX → thunk supplies the hidden slot
+- slots past the PC interface are Xbox-only methods → logged stubs
+- `Create*` methods: Xbox IIDs replaced with PC IIDs, Xbox-only flags dropped, results patched in turn
+
+### The current wall: Xbox GPU memory model
+
+On Xbox the CPU and GPU share one address space that the **title** manages: it reserves GPU
+VA ranges, maps physical pages into them, creates resources *at chosen GPU addresses*
+(Xbox-only device slot 133, `ID3D12Resource`), and computes descriptor handles itself. On PC
+the driver owns GPU memory and addresses. Bridging this needs:
+
+1. Resources created at title-chosen GPU VAs → backing heaps + a GPU VA translation table
+2. Translating every GPU VA the title puts into command lists, root arguments, VB/IB views and indirect args
+3. Descriptor handles: map title-computed CPU/GPU handles onto real descriptor heaps
+4. Texture layouts: Xbox tiled/swizzled formats → PC layouts
+5. Shaders: Xbox shader blobs → something PC D3D12 accepts (not yet examined)
+
+Hardware note: the test PC's GPU is a Radeon RX 580 (FL 12_0, no DXR / mesh shaders). A 2026
+title's renderer will likely need a newer GPU even once translation exists.
 
 Still to do:
 

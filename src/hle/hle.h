@@ -20,6 +20,7 @@ void hle_register(const HleExport* table, int count);
 // Base address of the mapped game image (set by the loader before imports are resolved).
 void hle_set_image_base(void* base, size_t size);
 void* hle_image_base();
+size_t hle_image_size();
 // True if p lies inside the game image; *rva receives its offset.
 bool hle_rva(const void* p, uint64_t* rva);
 

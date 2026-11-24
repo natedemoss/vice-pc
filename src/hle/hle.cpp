@@ -19,6 +19,7 @@ void hle_set_image_base(void* base, size_t size) {
     g_image_size = size;
 }
 void* hle_image_base() { return g_image_base; }
+size_t hle_image_size() { return g_image_size; }
 
 static std::wstring& game_path_storage() {
     static std::wstring* s = new std::wstring();

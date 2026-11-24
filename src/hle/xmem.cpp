@@ -69,7 +69,19 @@ void __cdecl XMemFree_hle(void* p, uint64_t attributes) {
 // Observed in the reference title right after D3D12ConfigureVirtualMemoryX:
 // multi-GB MEM_RESERVE calls with Xbox-only flag bits (0x20400000) and Xbox page
 // protections (e.g. 0x21). We keep the standard Windows bits and pick a sane protection.
-constexpr DWORD kStdTypeBits = MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN;
+// Placeholder flags matter: the title reserves with MEM_RESERVE_PLACEHOLDER and later
+// splits the range with VirtualFree(MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER).
+constexpr DWORD kReservePlaceholder = 0x40000;  // MEM_RESERVE_PLACEHOLDER
+constexpr DWORD kReplacePlaceholder = 0x4000;   // MEM_REPLACE_PLACEHOLDER
+constexpr DWORD kStdTypeBits =
+    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | kReservePlaceholder | kReplacePlaceholder;
+
+using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+VirtualAlloc2Fn virtual_alloc2() {
+    static VirtualAlloc2Fn fn = reinterpret_cast<VirtualAlloc2Fn>(
+        GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
+    return fn;
+}
 
 DWORD translate_protect(DWORD xbox_protect, DWORD type) {
     if (!(type & MEM_COMMIT)) return PAGE_NOACCESS;  // reservation only
@@ -83,7 +95,10 @@ void* __cdecl XMemVirtualAlloc_hle(void* address, SIZE_T size, DWORD type, DWORD
     DWORD win_type = type & kStdTypeBits;
     if (!(win_type & (MEM_COMMIT | MEM_RESERVE | MEM_RESET))) win_type |= MEM_RESERVE;
     DWORD win_protect = translate_protect(protect, win_type);
-    void* p = VirtualAlloc(address, size, win_type, win_protect);
+    if (win_type & kReservePlaceholder) win_protect = PAGE_NOACCESS;  // required for placeholders
+    void* p = (win_type & (kReservePlaceholder | kReplacePlaceholder)) && virtual_alloc2()
+                  ? virtual_alloc2()(nullptr, address, size, win_type, win_protect, nullptr, 0)
+                  : VirtualAlloc(address, size, win_type, win_protect);
     if (logged.fetch_add(1) < 64) {
         LOG("[xmem] XMemVirtualAlloc(addr=%p, size=0x%llx, type=0x%08lx, prot=0x%lx, extra=0x%lx) -> %p%s", address,
             (unsigned long long)size, type, protect, extra, p, p ? "" : " FAILED");
@@ -92,7 +107,65 @@ void* __cdecl XMemVirtualAlloc_hle(void* address, SIZE_T size, DWORD type, DWORD
     return p;
 }
 
+// ---- Physical pages -----------------------------------------------------------
+//
+// Xbox titles allocate 64 KB physical pages and map them into their own reserved
+// ranges (like AllocateUserPhysicalPages / MapUserPhysicalPages). Observed call:
+//   XMemAllocatePhysicalPages(0x280, &pageCount, pageArray) == TRUE, count unchanged.
+// Emulation: page "frame numbers" are just unique ids; mapping commits fresh memory
+// at the target address, unmapping decommits it. Contents are not shared between
+// two mappings of the same page (aliasing) — revisit if the title relies on it.
+constexpr uint64_t kPhysPageSize = 64 * 1024;
+std::atomic<uint64_t> g_next_pfn{0x100000};
+std::atomic<uint64_t> g_phys_pages_live{0};
+std::atomic<int> g_phys_logged{0};
+
+BOOL __cdecl XMemAllocatePhysicalPages_hle(uint64_t flags, uint64_t* page_count, uint64_t* page_array) {
+    if (!page_count || !page_array) return FALSE;
+    uint64_t n = *page_count;
+    uint64_t first = g_next_pfn.fetch_add(n);
+    for (uint64_t i = 0; i < n; ++i) page_array[i] = first + i;
+    g_phys_pages_live += n;
+    if (g_phys_logged.fetch_add(1) < 32) {
+        LOG("[xmem] XMemAllocatePhysicalPages(flags=0x%llx, %llu pages = %llu MB) -> pfn 0x%llx..",
+            (unsigned long long)flags, (unsigned long long)n, (unsigned long long)(n * kPhysPageSize >> 20),
+            (unsigned long long)first);
+    }
+    return TRUE;
+}
+
+BOOL __cdecl XMemFreePhysicalPages_hle(uint64_t flags, uint64_t* page_count, uint64_t* page_array) {
+    (void)flags;
+    (void)page_array;
+    if (page_count) g_phys_pages_live -= *page_count;
+    return TRUE;
+}
+
+BOOL map_range(void* va, uint64_t pages, const uint64_t* page_array, const char* api) {
+    size_t bytes = (size_t)(pages * kPhysPageSize);
+    void* p;
+    if (page_array) {
+        p = VirtualAlloc(va, bytes, MEM_COMMIT, PAGE_READWRITE);
+        if (!p) p = VirtualAlloc(va, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);  // not inside a reservation
+    } else {
+        p = VirtualFree(va, bytes, MEM_DECOMMIT) ? va : nullptr;  // NULL page array = unmap
+    }
+    if (g_phys_logged.fetch_add(1) < 32 || !p) {
+        LOG("[xmem] %s(va=%p, %llu pages, %s) -> %s%s", api, va, (unsigned long long)pages,
+            page_array ? "map" : "unmap", p ? "ok" : "FAILED", p ? "" : "");
+    }
+    if (!p) LOG("[xmem]   error %lu", GetLastError());
+    return p ? TRUE : FALSE;
+}
+
+BOOL __cdecl XMemMapPhysicalPages_hle(void* va, uint64_t pages, const uint64_t* page_array) {
+    return map_range(va, pages, page_array, "XMemMapPhysicalPages");
+}
+
 const HleExport kExports[] = {
+    {"xmem.dll", "XMemAllocatePhysicalPages", reinterpret_cast<void*>(&XMemAllocatePhysicalPages_hle)},
+    {"xmem.dll", "XMemFreePhysicalPages", reinterpret_cast<void*>(&XMemFreePhysicalPages_hle)},
+    {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages_hle)},
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc_hle)},
     {"xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&XMemAlloc_hle)},
     {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAlloc_hle)},

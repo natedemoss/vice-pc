@@ -9,7 +9,7 @@
 
 #include <cstdint>
 
-constexpr int kProbeSlots = 64;
+constexpr int kProbeSlots = 192;  // D3D12 device interfaces have 80+ methods; Xbox adds more
 
 struct ProbeType;
 
