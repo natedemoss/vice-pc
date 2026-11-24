@@ -1194,6 +1194,37 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Device_GetResourceAllocationIn
     return ret;
 }
 
+// Xbox-only device slot 127: committed resource (game+0x193e1b4), argument order
+// (heapProps, heapFlags, desc, state, clear, x1, x2, x3, riid, out). Reference title passes
+// heap flags 8 (ALLOW_DISPLAY: presentable targets). Created as a PC committed resource.
+HRESULT STDMETHODCALLTYPE Device_CreateCommittedResourceX(ID3D12Device* self, const D3D12_HEAP_PROPERTIES* hp,
+                                                          UINT heap_flags, const D3D12_RESOURCE_DESC* xdesc, UINT state,
+                                                          const D3D12_CLEAR_VALUE* clear, void*, void*, void*, REFIID,
+                                                          void** out) {
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
+                                           const D3D12_RESOURCE_DESC*, D3D12_RESOURCE_STATES,
+                                           const D3D12_CLEAR_VALUE*, REFIID, void**);
+    D3D12_RESOURCE_DESC d = *xdesc;
+    sanitize_desc(d);
+    if (!(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) clear = nullptr;
+    D3D12_HEAP_PROPERTIES props{D3D12_HEAP_TYPE_DEFAULT};
+    if (hp && (hp->Type == D3D12_HEAP_TYPE_UPLOAD || hp->Type == D3D12_HEAP_TYPE_READBACK)) props.Type = hp->Type;
+    D3D12_RESOURCE_STATES st = props.Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
+                               : props.Type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                                        : D3D12_RESOURCE_STATE_COMMON;
+    if (out) *out = nullptr;
+    HRESULT hr = orig<Fn>(self, 27)(self, &props, D3D12_HEAP_FLAG_NONE, &d, st, clear, __uuidof(ID3D12Resource), out);
+    if (FAILED(hr) && clear) hr = orig<Fn>(self, 27)(self, &props, D3D12_HEAP_FLAG_NONE, &d, st, nullptr,
+                                                   __uuidof(ID3D12Resource), out);
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 40 || FAILED(hr))
+        LOG("[d3d12] CreateCommittedResourceX(heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x state=0x%x) -> 0x%08lx",
+            hp ? hp->Type : -1, heap_flags, xdesc->Dimension, (unsigned long long)xdesc->Width, xdesc->Height,
+            xdesc->Format, xdesc->Flags, state, hr);
+    if (SUCCEEDED(hr)) patch_resource(*out);
+    return hr;
+}
+
 HRESULT STDMETHODCALLTYPE Device_CheckFeatureSupport(ID3D12Device* self, D3D12_FEATURE f, void* data, UINT size) {
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, D3D12_FEATURE, void*, UINT);
     HRESULT hr = orig<Fn>(self, 13)(self, f, data, size);
@@ -1285,6 +1316,7 @@ HRESULT d3d12_create_title_device(void** out) {
     OV(133, Device_CreateResourceAtAddressX);  // Xbox: resource at a title-chosen GPU VA
     OV(25, Device_GetResourceAllocationInfo);
     OV(108, Device_GetResourceAllocationInfoX);  // Xbox: allocation info + per-resource info
+    OV(127, Device_CreateCommittedResourceX);  // Xbox: committed resource (display targets)
     OV(17, Device_CreateCBV);
     OV(18, Device_CreateSRV);
     OV(19, Device_CreateUAV);
