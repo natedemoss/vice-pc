@@ -72,7 +72,7 @@ void STDMETHODCALLTYPE Queue_EnqueueRequest(ProbeObject*, const uint64_t* req) {
     const bool log = g_req_logged.fetch_add(1) < 24;
 
     if (!file || file->type != file_type() || !dest) {
-        if (log) LOG("[dstorage] EnqueueRequest: unsupported source/destination (opts=0x%llx src=%p dst=%p)",
+        static std::atomic<int> bad{0}; if (bad.fetch_add(1) < 40) LOG("[dstorage] EnqueueRequest: unsupported source/destination (opts=0x%llx src=%p dst=%p)",
                      (unsigned long long)opts, file, dest);
         return;
     }
@@ -83,7 +83,7 @@ void STDMETHODCALLTYPE Queue_EnqueueRequest(ProbeObject*, const uint64_t* req) {
         bool ok = read_at(h, offset, dest, n);
         g_reads.fetch_add(1);
         g_read_bytes.fetch_add(n);
-        if (log) LOG("[dstorage] read %u bytes @0x%llx -> %p %s", n, (unsigned long long)offset, dest, ok ? "ok" : "FAILED");
+        if (log || !ok) LOG("[dstorage] read %u bytes @0x%llx -> %p %s", n, (unsigned long long)offset, dest, ok ? "ok" : "FAILED");
         return;
     }
     // Format 1: zlib (blocks start 78 DA). Read the source block, inflate into the destination.
@@ -94,9 +94,16 @@ void STDMETHODCALLTYPE Queue_EnqueueRequest(ProbeObject*, const uint64_t* req) {
     if (ok && fmt == 1) n = zlib_inflate(src.data(), size, dest, static_cast<size_t>(dest_size));
     g_compressed.fetch_add(1);
     g_read_bytes.fetch_add(n > 0 ? static_cast<uint64_t>(n) : 0);
-    if (log || n < 0)
-        LOG("[dstorage] fmt=%u %u -> %llu bytes @0x%llx: %s (%lld bytes)", fmt, size, (unsigned long long)dest_size,
-            (unsigned long long)offset, !ok ? "READ FAILED" : n < 0 ? "DECODE FAILED" : "inflated", n);
+    const bool odd = fmt != 1 || (n >= 0 && static_cast<uint64_t>(n) != dest_size);
+    static std::atomic<int> odd_logged{0};
+    if (log || n < 0 || (odd && odd_logged.fetch_add(1) < 40))
+        LOG("[dstorage] fmt=%u %u -> %llu bytes @0x%llx: %s (%lld bytes)%s", fmt, size, (unsigned long long)dest_size,
+            (unsigned long long)offset, !ok ? "READ FAILED" : n < 0 ? "DECODE FAILED" : "inflated", n,
+            odd ? " [unusual]" : "");
+    uint64_t total = g_compressed.load();
+    if ((total & (total - 1)) == 0 && total >= 1024)
+        LOG("[dstorage] %llu compressed requests, %llu uncompressed, %llu MB delivered", (unsigned long long)total,
+            (unsigned long long)g_reads.load(), (unsigned long long)(g_read_bytes.load() >> 20));
 }
 
 void STDMETHODCALLTYPE Queue_EnqueueStatus(ProbeObject*, void* status, uint32_t index) {
