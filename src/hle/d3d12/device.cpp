@@ -380,6 +380,15 @@ bool in_real_heap(uint64_t h) {
     return h - it->first < it->second;
 }
 
+// A view whose kind the resource was not created for removes the PC device.
+bool resource_allows(ID3D12Resource* r, D3D12_RESOURCE_FLAGS needed, const char* what) {
+    if (!r) return true;  // null views are fine
+    if (r->GetDesc().Flags & needed) return true;
+    static std::atomic<int> n{0};
+    if (n.fetch_add(1) < 10) LOG("[d3d12] %s on resource %p without the matching flag: skipped", what, r);
+    return false;
+}
+
 D3D12_CPU_DESCRIPTOR_HANDLE tcpu(D3D12_CPU_DESCRIPTOR_HANDLE h) {
     h.ptr = static_cast<SIZE_T>(gm_translate(GM_DESC_CPU, h.ptr));
     return h;
@@ -428,6 +437,7 @@ void STDMETHODCALLTYPE Device_CreateUAV(ID3D12Device* self, ID3D12Resource* r, I
                                         const D3D12_UNORDERED_ACCESS_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, ID3D12Resource*,
                                         const D3D12_UNORDERED_ACCESS_VIEW_DESC*, D3D12_CPU_DESCRIPTOR_HANDLE);
+    if (!resource_allows(r, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, "CreateUAV")) return;
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
     orig<Fn>(self, 19)(self, r, counter, d, dst);
@@ -438,6 +448,7 @@ void STDMETHODCALLTYPE Device_CreateRTV(ID3D12Device* self, ID3D12Resource* r, c
                                         D3D12_CPU_DESCRIPTOR_HANDLE h) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_RENDER_TARGET_VIEW_DESC*,
                                         D3D12_CPU_DESCRIPTOR_HANDLE);
+    if (!resource_allows(r, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, "CreateRTV")) return;
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
     orig<Fn>(self, 20)(self, r, d, dst);
@@ -448,6 +459,7 @@ void STDMETHODCALLTYPE Device_CreateDSV(ID3D12Device* self, ID3D12Resource* r, c
                                         D3D12_CPU_DESCRIPTOR_HANDLE h) {
     using Fn = void(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Resource*, const D3D12_DEPTH_STENCIL_VIEW_DESC*,
                                         D3D12_CPU_DESCRIPTOR_HANDLE);
+    if (!resource_allows(r, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, "CreateDSV")) return;
     D3D12_CPU_DESCRIPTOR_HANDLE dst = vcpu(h);
     if (!dst.ptr) return;
     orig<Fn>(self, 21)(self, r, d, dst);
@@ -729,6 +741,7 @@ HRESULT STDMETHODCALLTYPE Device_CreateResourceAtAddressX(ID3D12Device* self, ui
                                                           const D3D12_CLEAR_VALUE* clear, REFIID, void** out) {
     D3D12_RESOURCE_DESC d = *xdesc;
     d.Flags &= static_cast<D3D12_RESOURCE_FLAGS>(0x3F);  // drop Xbox-only flags (e.g. 0x20000)
+    if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) d.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
         // Xbox alignment / layout values describe console tiling; let the PC driver choose.
         d.Alignment = 0;
@@ -1127,6 +1140,8 @@ HRESULT STDMETHODCALLTYPE Device_CreatePipelineStateX3(ID3D12Device* self, const
 // order by which register holds the device, sanitise the descs and call the PC method.
 void sanitize_desc(D3D12_RESOURCE_DESC& d) {
     d.Flags &= static_cast<D3D12_RESOURCE_FLAGS>(0x3F);
+    // Xbox allows depth-stencil + UAV on one resource; PC rejects the combination.
+    if (d.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) d.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         d.Format = DXGI_FORMAT_UNKNOWN;
