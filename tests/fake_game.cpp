@@ -4,7 +4,10 @@
 #include <thread>
 #include <vector>
 
+#include <intrin.h>
+
 extern "C" __declspec(dllimport) int XFakeXboxOnly(int);
+extern "C" unsigned long _tls_index;  // provided by the CRT's TLS support
 
 thread_local int tls_value = 42;
 
@@ -21,6 +24,12 @@ static int fails = 0;
 int main() {
     // 1. Implicit TLS on the main thread.
     CHECK(tls_value == 42, "main thread TLS initial value %d", tls_value);
+
+    // 1b. Console titles read their TLS block straight from slot 0 (local-exec model),
+    //     so the loader must put our block there and set _tls_index to 0.
+    void** tls_array = reinterpret_cast<void**>(__readgsqword(0x58));
+    CHECK(_tls_index == 0, "_tls_index is %lu, expected 0", _tls_index);
+    CHECK(tls_array[0] == tls_array[_tls_index], "slot 0 does not hold the game's TLS block");
     tls_value = 7;
 
     // 2. Implicit TLS on new threads: each gets a fresh copy.

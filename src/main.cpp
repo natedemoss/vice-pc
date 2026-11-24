@@ -19,13 +19,16 @@ namespace fs = std::filesystem;
 namespace {
 
 LoadedImage g_img;
+void print_backtrace(CONTEXT ctx);
 
 // DLLs that exist only on Xbox (or ship as Xbox builds inside the game package).
 // Never load these from disk; every function is HLE'd or stubbed.
 const char* kXboxOnlyDlls[] = {
     "xmem.dll",        "d3d12_xs.dll",       "xg_xs.dll",
     "chad.dll",        "xcrdapi.dll",        "xapu.dll",
-    "acphal.dll",      "gameinput.dll",      "xboxbvhbuilder.dll",
+    // gameinput.dll is NOT here: Windows ships GameInput with the same v0 interface,
+    // and GameInputCreate is ordinal 1 on both platforms.
+    "acphal.dll",      "xboxbvhbuilder.dll",
     "amd_fidelityfx_loader_xbox.dll",        "amd_fidelityfx_upscaler_xbox.dll",
     "bink2scarlett.dll", "libhttpclient.gdk.dll", "xcurl.dll",
 };
@@ -35,13 +38,30 @@ void usage() {
         "usage: vice-pc <game.exe> [options]\n"
         "  --no-run             map and resolve imports, print a report, do not execute\n"
         "  --stop-on-stub       stop at the first call into an unimplemented Xbox function\n"
+        "  --break-on-int3      don't step over the title's __debugbreak() calls\n"
         "  --stub-dll <name>    also treat <name> as Xbox-only (repeatable)\n"
         "  --root <dir>         game package root (default: folder with MicrosoftGame.Config)\n"
         "  --log <file>         log file (default: vice-pc.log)\n");
 }
 
+bool g_skip_int3 = true;
+
 LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
+
+    // Titles use __debugbreak() as "tell the debugger" on non-fatal failures and then
+    // carry on. With no debugger attached that would kill the process, so log it and
+    // step over the 1-byte int3.
+    if (code == EXCEPTION_BREAKPOINT && g_skip_int3 && g_img.contains(ep->ExceptionRecord->ExceptionAddress)) {
+        static std::atomic<int> skipped{0};
+        int n = skipped.fetch_add(1);
+        if (n < 16) {
+            LOG("[int3] debug break at game+0x%llx, skipping", (unsigned long long)g_img.rva_of(ep->ExceptionRecord->ExceptionAddress));
+            if (n < 4) print_backtrace(*ep->ContextRecord);
+        }
+        ep->ContextRecord->Rip += 1;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     // Ignore C++ throws, debugger prints and thread naming: games use these normally.
     if (code == 0xE06D7363 || code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C ||
         code == 0x406D1388 || code == DBG_CONTROL_C) {
@@ -62,8 +82,50 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
                                                                     : "read",
                 (unsigned long long)ep->ExceptionRecord->ExceptionInformation[1]);
         }
+        // Heap corruption fails fast and never reaches the unhandled filter, so trace it here.
+        // Breakpoints are the title's asserts / fatal-error paths: trace those too.
+        if (code == 0xC0000374 || code == EXCEPTION_BREAKPOINT) {
+            print_backtrace(*ep->ContextRecord);
+            log_flush();
+        }
     }
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void log_address(int frame, DWORD64 pc) {
+    if (g_img.contains(reinterpret_cast<void*>(pc))) {
+        LOG("        #%-2d game+0x%llx", frame, (unsigned long long)g_img.rva_of(reinterpret_cast<void*>(pc)));
+        return;
+    }
+    HMODULE mod = nullptr;
+    char name[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(pc), &mod)) {
+        GetModuleFileNameA(mod, name, sizeof(name));
+        const char* base = strrchr(name, '\\');
+        LOG("        #%-2d %s+0x%llx", frame, base ? base + 1 : name, (unsigned long long)(pc - (DWORD64)mod));
+    } else {
+        LOG("        #%-2d 0x%llx", frame, (unsigned long long)pc);
+    }
+}
+
+// Walks the stack with the unwind tables (ours are registered via RtlAddFunctionTable).
+void print_backtrace(CONTEXT ctx) {
+    LOG("        backtrace:");
+    for (int frame = 0; frame < 24 && ctx.Rip; ++frame) {
+        log_address(frame, ctx.Rip);
+        DWORD64 image_base = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        if (!fn) {
+            // Leaf function: return address is at [rsp].
+            ctx.Rip = *reinterpret_cast<DWORD64*>(ctx.Rsp);
+            ctx.Rsp += 8;
+            continue;
+        }
+        void* handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, fn, &ctx, &handler_data, &establisher, nullptr);
+    }
 }
 
 LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* ep) {
@@ -75,6 +137,8 @@ LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* ep) {
     LOG("        rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx", c->Rax, c->Rbx, c->Rcx, c->Rdx);
     LOG("        rsi=%016llx rdi=%016llx rsp=%016llx rbp=%016llx", c->Rsi, c->Rdi, c->Rsp, c->Rbp);
     LOG("        r8 =%016llx r9 =%016llx r10=%016llx r11=%016llx", c->R8, c->R9, c->R10, c->R11);
+    LOG("        r12=%016llx r13=%016llx r14=%016llx r15=%016llx", c->R12, c->R13, c->R14, c->R15);
+    print_backtrace(*c);
     stub_print_summary();
     log_flush();
     return EXCEPTION_EXECUTE_HANDLER;
@@ -100,6 +164,7 @@ int wmain(int argc, wchar_t** argv) {
         std::wstring a = argv[i];
         if (a == L"--no-run") no_run = true;
         else if (a == L"--stop-on-stub") opt.stop_on_stub = true;
+        else if (a == L"--break-on-int3") g_skip_int3 = false;
         else if (a == L"--stub-dll" && i + 1 < argc) {
             std::wstring w = argv[++i];
             std::string s;

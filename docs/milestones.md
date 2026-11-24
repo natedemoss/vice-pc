@@ -21,17 +21,30 @@ Reference target: `game_scarlett_master.exe`, package version 1.0.2.1
   **`d3d12_xs.dll!D3D12ConfigureVirtualMemoryX`** (called from game+0x1e1cfe5) after
   CRT startup and the TLS callbacks
 
-## 2. Boot to main loop
+## 2. Boot to main loop (in progress)
 
-- `xmem.dll`: `XMemAlloc`/`XMemFree`/`*Default` done. Still to do: `XMemVirtualAlloc`, the physical-page APIs, `XMemTransferMemory`
+Each run of `--stop-on-stub` gets further. Stops so far, in order:
+
+| # | Stop | Resolution |
+|---|---|---|
+| 1 | `d3d12_xs!D3D12ConfigureVirtualMemoryX` | HLE: return `S_OK` (PC D3D12 manages GPU VA itself) |
+| 2 | `xmem!XMemVirtualAlloc` (2 × 24 GB GPU reservations + ~4.7 GB of pools) | HLE: `VirtualAlloc`, Xbox-only type/protect bits stripped |
+| 3 | Bad virtual call in a static constructor | **Loader fix:** title reads TLS from slot 0 directly (local-exec model), so the game's block now lives in slot 0 |
+| 4 | `__debugbreak()` after `XGameRuntimeInitialize` fails | Loader steps over title debug breaks (`--break-on-int3` to disable). Game continues into `main` |
+| 5 | `GameInput!GameInputCreate` (ordinal 1) | Use Windows' own GameInput (same v0 interface) |
+| 6 | **`XCRDAPI!DStorageGetFactory`** | **Next:** a DirectStorage factory backed by file I/O on the dump |
+
+Still to do:
+
+- `xmem.dll`: physical-page APIs, `XMemTransferMemory`
+- `xgameruntime.dll` stand-in (XUser, XTaskQueue, XGameSave, ...). `XGameRuntimeInitialize` currently fails
 - File system: map Xbox package paths to the dump folder; read `.rpf` archives and `.ttpf` streaming packs
-- `XCRDAPI.dll!DStorageGetFactory`: back it with PC DirectStorage or plain file I/O
 - `GetModuleHandle(NULL)` and the PEB image base should point at the game, not the loader
 
 ## 3. Audio and input
 
 - `xapu.dll`, `AcpHal.dll`, `chad.dll` (Xbox audio hardware): replace with XAudio2 or WASAPI
-- `GameInput.dll` (imported by ordinal): map to the PC GameInput or XInput
+- ~~`GameInput.dll`~~: works with Windows' built-in GameInput
 - `Bink2Scarlett.dll`: video playback
 
 ## 4. Graphics (the hard part)

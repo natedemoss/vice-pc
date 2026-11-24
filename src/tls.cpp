@@ -4,93 +4,59 @@
 #include "stubs.h"
 
 #include <windows.h>
-#include <psapi.h>
-#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <vector>
 
+// Implicit TLS for the mapped game image.
+//
+// Console titles are built assuming the main executable owns implicit-TLS slot 0,
+// and read their thread-local data straight from ThreadLocalStoragePointer[0]
+// without consulting _tls_index. Under the loader, slot 0 belongs to vice-pc.exe.
+// So for every thread we swap the game's TLS block into slot 0 of the array the OS
+// allocated, and swap the original back before the OS tears the thread down.
+//
+// Consequence: the host must never use implicit TLS itself (no thread_local,
+// no thread-safe magic statics; see /Zc:threadSafeInit- in CMakeLists.txt).
+// Host per-thread state lives in a dynamic TlsAlloc slot instead.
+
 namespace {
 
-// Offset of ThreadLocalStoragePointer in the x64 TEB.
-constexpr size_t kTebTlsPointer = 0x58;
-// Headroom so DLLs the OS loads later (which get the next free index) don't collide with us.
-constexpr DWORD kSlotHeadroom = 64;
+constexpr size_t kTebTlsPointer = 0x58;  // TEB.ThreadLocalStoragePointer (x64)
+constexpr DWORD kGameSlot = 0;
 
 std::atomic<bool> g_ready{false};
-DWORD g_slot = 0;
 const uint8_t* g_template = nullptr;
 size_t g_template_size = 0;
 size_t g_zero_fill = 0;
 void* g_image_base = nullptr;
-std::vector<PIMAGE_TLS_CALLBACK> g_callbacks;
+std::vector<PIMAGE_TLS_CALLBACK>& g_callbacks = *new std::vector<PIMAGE_TLS_CALLBACK>();
 
-// Per-thread bookkeeping (the host's own implicit TLS, set up by the OS loader).
-// Windows 10+ keeps a hidden header in front of the TLS array it allocates and
-// frees the array through that header at thread exit, so we must hand the
-// original array back before ntdll tears the thread down.
-thread_local void** t_original_array = nullptr;
-thread_local void** t_our_array = nullptr;
-thread_local void* t_our_block = nullptr;
+DWORD g_saved_slot = TLS_OUT_OF_INDEXES;  // dynamic TLS: the host's original slot-0 block
 
 void** teb_tls_array() {
     return *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(NtCurrentTeb()) + kTebTlsPointer);
 }
 
-void set_teb_tls_array(void** arr) {
-    *reinterpret_cast<void***>(reinterpret_cast<uint8_t*>(NtCurrentTeb()) + kTebTlsPointer) = arr;
-}
-
-// Highest implicit-TLS index the OS loader has assigned to any module in the process.
-bool highest_os_tls_index(DWORD& out) {
-    HMODULE mods[1024];
-    DWORD needed = 0;
-    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return false;
-    size_t n = std::min<size_t>(needed / sizeof(HMODULE), 1024);
-    bool any = false;
-    out = 0;
-    for (size_t i = 0; i < n; ++i) {
-        auto base = reinterpret_cast<uint8_t*>(mods[i]);
-        auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
-        auto nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-        auto d = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
-        if (!d.Size) continue;
-        auto tls = reinterpret_cast<IMAGE_TLS_DIRECTORY64*>(base + d.VirtualAddress);
-        if (!tls->AddressOfIndex) continue;
-        DWORD idx = *reinterpret_cast<DWORD*>(tls->AddressOfIndex);
-        if (!any || idx > out) out = idx;
-        any = true;
-    }
-    return true;
-}
-
 bool install_for_current_thread() {
-    void** old = teb_tls_array();
-    size_t count = g_slot + 1;
-    auto arr = static_cast<void**>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, count * sizeof(void*)));
+    void** arr = teb_tls_array();
+    if (!arr) return false;  // the host exe has a TLS directory, so the OS always allocates one
     void* block = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, g_template_size + g_zero_fill + 16);
-    if (!arr || !block) return false;
-    if (old) {
-        // Every slot below g_slot - kSlotHeadroom was handed out by the OS loader, so the
-        // old array is at least that long. Copy only those entries.
-        memcpy(arr, old, (g_slot - kSlotHeadroom) * sizeof(void*));
-    }
+    if (!block) return false;
     memcpy(block, g_template, g_template_size);
-    arr[g_slot] = block;
-    t_original_array = old;
-    t_our_array = arr;
-    t_our_block = block;
-    set_teb_tls_array(arr);
+    TlsSetValue(g_saved_slot, arr[kGameSlot]);
+    arr[kGameSlot] = block;
     return true;
 }
 
 void restore_current_thread() {
-    if (!t_our_array) return;
-    if (teb_tls_array() == t_our_array) set_teb_tls_array(t_original_array);
-    HeapFree(GetProcessHeap(), 0, t_our_array);
-    HeapFree(GetProcessHeap(), 0, t_our_block);
-    t_our_array = nullptr;
-    t_our_block = nullptr;
+    void** arr = teb_tls_array();
+    void* original = TlsGetValue(g_saved_slot);
+    if (!arr || !original) return;
+    void* ours = arr[kGameSlot];
+    arr[kGameSlot] = original;
+    TlsSetValue(g_saved_slot, nullptr);
+    HeapFree(GetProcessHeap(), 0, ours);
 }
 
 void run_callbacks(DWORD reason) {
@@ -137,13 +103,12 @@ bool tls_setup(LoadedImage& img) {
     g_zero_fill = tls->SizeOfZeroFill;
     g_image_base = img.base;
 
-    DWORD highest = 0;
-    if (!highest_os_tls_index(highest)) {
-        LOG("[tls] EnumProcessModules failed");
+    g_saved_slot = TlsAlloc();
+    if (g_saved_slot == TLS_OUT_OF_INDEXES) {
+        LOG("[tls] TlsAlloc failed");
         return false;
     }
-    g_slot = highest + 1 + kSlotHeadroom;
-    if (tls->AddressOfIndex) *reinterpret_cast<DWORD*>(tls->AddressOfIndex) = g_slot;
+    if (tls->AddressOfIndex) *reinterpret_cast<DWORD*>(tls->AddressOfIndex) = kGameSlot;
 
     if (tls->AddressOfCallBacks) {
         for (auto cb = reinterpret_cast<PIMAGE_TLS_CALLBACK*>(tls->AddressOfCallBacks); *cb; ++cb) {
@@ -153,8 +118,8 @@ bool tls_setup(LoadedImage& img) {
 
     if (!install_for_current_thread()) return false;
     g_ready.store(true);
-    LOG("[tls] slot %lu, template %zu bytes + %zu zero-fill, %zu callbacks", g_slot, g_template_size, g_zero_fill,
-        g_callbacks.size());
+    LOG("[tls] game block in slot %lu, template %zu bytes + %zu zero-fill, %zu callbacks", kGameSlot,
+        g_template_size, g_zero_fill, g_callbacks.size());
     return true;
 }
 
