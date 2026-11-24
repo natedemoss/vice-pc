@@ -57,7 +57,10 @@ Each run of `--stop-on-stub` gets further. Stops so far, in order:
 | 28 | Title scribbles over PC command-list objects | **Xbox command lists are user-mode GPU packet buffers** the title writes into inline. Title lists are now title-owned buffers (packets kept, not decoded yet) |
 | 29 | Fence completed-value pointer, audio processor (AcpHal), `GetResourceAllocationInfo` | Fence value mirror thread; APU heap + shape contexts; allocation info with sanitised descs |
 | 30 | Title storage drive `T:\` missing | `T:\`, `S:\`, `D:\` map to `%LOCALAPPDATA%\vice-pc\<letter>` |
-| 31 | **Main loop running and submitting command lists (~260k submissions/min, no packets executed). A streamed asset lookup fails (title assert at `game+0xcc2834`, keyed by hash), then a null dereference** | **Current**: next step is the title's asset-streaming path (`game+0x34beb0`) |
+| 31 | Asset lookup fails (title assert at `game+0xcc2834`) | Breakpoint tracing: the title's texture-size routine uses Xbox device slot 108 (allocation info + per-resource info); as a stub it left sizes unset, the GPU pool allocator failed. Implemented |
+| 32 | GPU device removed (`DXGI_ERROR_INVALID_CALL`) | Post-call device checks found it: buffer views running past their buffer (Xbox doesn't check, PC removes the device). Views clamped. Also: Map on title-address resources, Signal/Wait only on device fences |
+| 33 | Null shadow-map / display targets | Device slot 127 (committed resources: 3840×2160 display buffers). Xbox allows depth-stencil + UAV on one resource, PC rejects it; views validated against resource flags |
+| 34 | **The title runs without crashing (60 s+), main loop submitting, intro video requested (`BinkOpenWithOptions`)** | **Current**: nothing is presented yet (packets not decoded, shaders not translated, Bink not implemented) |
 
 ### What the loading screen still needs
 
