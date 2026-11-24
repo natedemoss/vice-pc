@@ -12,6 +12,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 add_executable(vice-pc
   src/main.cpp
+  src/inflate.cpp
   src/log.cpp
   src/pe_loader.cpp
   src/stubs.cpp
@@ -22,10 +23,14 @@ add_executable(vice-pc
   src/hle/d3d12_xs.cpp
   src/hle/probe.cpp
   src/hle/xcrdapi.cpp
+  src/hle/xg_xs.cpp
+  src/hle/crt.cpp
   src/hle/kernel.cpp
   src/hle/d3d12/vtpatch.cpp
   src/hle/d3d12/device.cpp
   src/hle/d3d12/dxgi.cpp
+  src/hle/d3d12/gpumem.cpp
+  src/hle/d3d12/cmdlist.cpp
 )
 target_compile_definitions(vice-pc PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
 # /Zc:threadSafeInit-: thread-safe statics use implicit TLS, and the game owns TLS slot 0 (see src/tls.cpp).
@@ -41,6 +46,8 @@ include(CTest)
 if(BUILD_TESTING)
   add_library(fake_xbox SHARED tests/fake_xbox.cpp)
   add_executable(fake_game tests/fake_game.cpp)
+  add_executable(inflate_test tests/inflate_test.cpp src/inflate.cpp)
+  add_test(NAME inflate COMMAND inflate_test)
   target_link_libraries(fake_game PRIVATE fake_xbox)
   target_link_options(fake_game PRIVATE /BASE:0x140000000)
 

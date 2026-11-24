@@ -158,3 +158,5 @@ const HleExport kExports[] = {
 HleRegistrar g_reg(kExports);
 
 }  // namespace
+
+std::wstring hle_translate_path(const wchar_t* path) { return translate(path); }

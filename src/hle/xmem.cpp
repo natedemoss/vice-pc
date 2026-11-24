@@ -162,7 +162,35 @@ BOOL __cdecl XMemMapPhysicalPages_hle(void* va, uint64_t pages, const uint64_t* 
     return map_range(va, pages, page_array, "XMemMapPhysicalPages");
 }
 
+// BOOL XMemMapPhysicalPagesScatter(const uint64_t* vas, uint32_t count, const uint64_t* pfns)
+// Reference title (game+0xf2cc3e): two parallel arrays, one 64 KB page each; pfn 0 = unmap.
+std::atomic<int> g_scatter_logged{0};
+BOOL __cdecl XMemMapPhysicalPagesScatter_hle(const uint64_t* vas, uint64_t count, const uint64_t* pfns) {
+    uint32_t n = static_cast<uint32_t>(count);
+    BOOL ok = TRUE;
+    uint32_t mapped = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        void* va = reinterpret_cast<void*>(vas[i]);
+        void* p;
+        if (pfns[i]) {
+            p = VirtualAlloc(va, kPhysPageSize, MEM_COMMIT, PAGE_READWRITE);
+            if (!p) p = VirtualAlloc(va, kPhysPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (p) ++mapped;
+        } else {
+            p = VirtualFree(va, kPhysPageSize, MEM_DECOMMIT) ? va : nullptr;
+        }
+        if (!p) {
+            LOG("[xmem] XMemMapPhysicalPagesScatter: page %u at %p failed (error %lu)", i, va, GetLastError());
+            ok = FALSE;
+        }
+    }
+    if (g_scatter_logged.fetch_add(1) < 16)
+        LOG("[xmem] XMemMapPhysicalPagesScatter(%u pages, %u mapped) -> %s", n, mapped, ok ? "ok" : "FAILED");
+    return ok;
+}
+
 const HleExport kExports[] = {
+    {"xmem.dll", "XMemMapPhysicalPagesScatter", reinterpret_cast<void*>(&XMemMapPhysicalPagesScatter_hle)},
     {"xmem.dll", "XMemAllocatePhysicalPages", reinterpret_cast<void*>(&XMemAllocatePhysicalPages_hle)},
     {"xmem.dll", "XMemFreePhysicalPages", reinterpret_cast<void*>(&XMemFreePhysicalPages_hle)},
     {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages_hle)},

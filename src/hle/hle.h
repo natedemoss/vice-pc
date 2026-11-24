@@ -32,6 +32,9 @@ const std::wstring& hle_game_path();
 void hle_set_package_root(const std::wstring& path);
 const std::wstring& hle_package_root();
 
+// Xbox path -> host path (G:\ -> package root). Unknown paths come back unchanged.
+std::wstring hle_translate_path(const wchar_t* path);
+
 // Registers a table at static-init time.
 struct HleRegistrar {
     template <int N>

@@ -40,12 +40,37 @@ void usage() {
         "  --stop-on-stub       stop at the first call into an unimplemented Xbox function\n"
         "  --break-on-int3      don't step over the title's __debugbreak() calls\n"
         "  --d3d-debug          enable the D3D12 debug layer\n"
+        "  --trap-fastfail      turn the title's __fastfail calls into logged exceptions\n"
+        "  --trace-d3d          log every D3D12 method the title calls (flushed per call)\n"
         "  --stub-dll <name>    also treat <name> as Xbox-only (repeatable)\n"
         "  --root <dir>         game package root (default: folder with MicrosoftGame.Config)\n"
         "  --log <file>         log file (default: vice-pc.log)\n");
 }
 
 bool g_skip_int3 = true;
+bool g_trap_fastfail = false;
+
+// --trap-fastfail: __fastfail (int 29h) ends the process without running any exception
+// handler. Rewrite the title's "mov ecx, code; int 29h" sequences to "mov ecx, code; ud2"
+// so the vectored handler can log the reason code and a backtrace. Diagnostic only.
+int patch_fastfails(LoadedImage& img) {
+    int n = 0;
+    auto* sec = IMAGE_FIRST_SECTION(img.nt);
+    for (int s = 0; s < img.nt->FileHeader.NumberOfSections; ++s, ++sec) {
+        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* p = img.base + sec->VirtualAddress;
+        size_t len = sec->Misc.VirtualSize;
+        for (size_t i = 0; i + 7 <= len; ++i) {
+            if (p[i] == 0xB9 && p[i + 2] == 0 && p[i + 3] == 0 && p[i + 4] == 0 && p[i + 5] == 0xCD &&
+                p[i + 6] == 0x29) {
+                p[i + 5] = 0x0F;
+                p[i + 6] = 0x0B;
+                ++n;
+            }
+        }
+    }
+    return n;
+}
 
 LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -85,7 +110,11 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
         }
         // Heap corruption fails fast and never reaches the unhandled filter, so trace it here.
         // Breakpoints are the title's asserts / fatal-error paths: trace those too.
-        if (code == 0xC0000374 || code == EXCEPTION_BREAKPOINT || code == EXCEPTION_ACCESS_VIOLATION) {
+        if (code == EXCEPTION_ILLEGAL_INSTRUCTION && g_trap_fastfail && g_img.contains(addr)) {
+            LOG("[fastfail] title __fastfail(%llu)", (unsigned long long)(ep->ContextRecord->Rcx & 0xFFFFFFFF));
+        }
+        if (code == 0xC0000374 || code == EXCEPTION_BREAKPOINT || code == EXCEPTION_ACCESS_VIOLATION ||
+            code == EXCEPTION_ILLEGAL_INSTRUCTION) {
             print_backtrace(*ep->ContextRecord);
             log_flush();
         }
@@ -129,6 +158,20 @@ void print_backtrace(CONTEXT ctx) {
     }
 }
 
+}  // namespace
+
+// Backtrace of the calling thread (used by HLE fail-fast traps, see hle/crt.cpp).
+void hle_log_backtrace(const char* why) {
+    LOG("[fatal] %s", why);
+    CONTEXT ctx;
+    RtlCaptureContext(&ctx);
+    print_backtrace(ctx);
+    stub_print_summary();
+    log_flush();
+}
+
+namespace {
+
 LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* ep) {
     void* addr = ep->ExceptionRecord->ExceptionAddress;
     LOG("[crash] unhandled exception 0x%08lx at %s0x%llx", ep->ExceptionRecord->ExceptionCode,
@@ -167,6 +210,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--stop-on-stub") opt.stop_on_stub = true;
         else if (a == L"--break-on-int3") g_skip_int3 = false;
         else if (a == L"--d3d-debug") SetEnvironmentVariableW(L"VICEPC_D3D_DEBUG", L"1");
+        else if (a == L"--trap-fastfail") g_trap_fastfail = true;
+        else if (a == L"--trace-d3d") SetEnvironmentVariableW(L"VICEPC_TRACE_D3D", L"1");
         else if (a == L"--stub-dll" && i + 1 < argc) {
             std::wstring w = argv[++i];
             std::string s;
@@ -202,6 +247,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (!pe_register_unwind(g_img)) return 2;
     if (!tls_setup(g_img)) return 2;
+    if (g_trap_fastfail) LOG("[ldr] --trap-fastfail: %d __fastfail sites patched", patch_fastfails(g_img));
     pe_protect_sections(g_img);
 
     if (no_run) {

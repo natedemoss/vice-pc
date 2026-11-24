@@ -9,6 +9,7 @@
 #include "../log.h"
 
 #include <windows.h>
+#include <d3d12.h>
 #include <cstdint>
 
 namespace {
@@ -42,7 +43,35 @@ HRESULT __cdecl D3D12XboxCreateDevice_hle(void* adapter, const uint32_t* params,
     return hr;
 }
 
+// HRESULT D3D12SerializeVersionedRootSignature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*, ID3DBlob** blob,
+//                                              ID3DBlob** error)
+// Same signature as PC d3d12.dll: forward it. Failures are logged with the runtime's error text.
+HRESULT __cdecl D3D12SerializeVersionedRootSignature_hle(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc,
+                                                         ID3DBlob** blob, ID3DBlob** error) {
+    ID3DBlob* err = nullptr;
+    HRESULT hr = D3D12SerializeVersionedRootSignature(desc, blob, &err);
+    static int logged = 0;
+    if (FAILED(hr) || logged++ < 20) {
+        UINT flags = 0, params = 0;
+        if (desc && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+            flags = desc->Desc_1_1.Flags;
+            params = desc->Desc_1_1.NumParameters;
+        } else if (desc) {
+            flags = desc->Desc_1_0.Flags;
+            params = desc->Desc_1_0.NumParameters;
+        }
+        LOG("[d3d12_xs] D3D12SerializeVersionedRootSignature(v=0x%x, %u params, flags=0x%x) -> 0x%08lx%s%s",
+            desc ? desc->Version : 0, params, flags, hr, err ? ": " : "",
+            err ? static_cast<const char*>(err->GetBufferPointer()) : "");
+    }
+    if (error) *error = err;
+    else if (err) err->Release();
+    return hr;
+}
+
 const HleExport kExports[] = {
+    {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature",
+     reinterpret_cast<void*>(&D3D12SerializeVersionedRootSignature_hle)},
     {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&D3D12ConfigureVirtualMemoryX_hle)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice_hle)},
 };
