@@ -2,7 +2,11 @@
 
 #include "../../log.h"
 
+#include <windows.h>
+#include <unknwn.h>
 #include <atomic>
+#include <iterator>
+#include <vector>
 #include <map>
 #include <shared_mutex>
 #include <unordered_map>
@@ -31,8 +35,33 @@ const char* kSpaceName[GM_SPACES] = {"gpu-va", "desc-cpu", "desc-gpu"};
 
 void gm_add_range(GmSpace space, uint64_t game, uint64_t size, uint64_t real, const char* what, void* owner) {
     Space& s = g_spaces[space];
-    std::unique_lock<std::shared_mutex> lk(s.mu);
-    s.ranges[game] = Range{size, real, owner};
+    // GPU VA owners are COM objects (ID3D12Resource): the table keeps its own reference so
+    // a lookup never returns a freed object, even if the title releases the resource
+    // through another interface pointer. A newer range that overlaps an older one
+    // (memory reused by the title) replaces it.
+    const bool com = space == GM_GPU_VA && owner;
+    std::vector<void*> dropped;
+    {
+        std::unique_lock<std::shared_mutex> lk(s.mu);
+        auto it = s.ranges.upper_bound(game);
+        if (it != s.ranges.begin()) {
+            auto prev = std::prev(it);
+            if (prev->first + prev->second.size > game) it = prev;
+        }
+        while (it != s.ranges.end() && it->first < game + size) {
+            if (it->second.owner) {
+                dropped.push_back(it->second.owner);
+                s.objects.erase(it->second.owner);
+            }
+            it = s.ranges.erase(it);
+        }
+        s.ranges[game] = Range{size, real, owner};
+    }
+    if (com) static_cast<IUnknown*>(owner)->AddRef();
+    if (space == GM_GPU_VA)
+        for (void* o : dropped) static_cast<IUnknown*>(o)->Release();  // outside the lock: may re-enter
+    static int logged = 0;
+    if (++logged > 200) return;
     LOG("[gpumem] %s %s: title 0x%llx..0x%llx -> real 0x%llx", kSpaceName[space], what, (unsigned long long)game,
         (unsigned long long)(game + size), (unsigned long long)real);
 }
@@ -74,6 +103,18 @@ bool gm_object(GmSpace space, const void* obj, uint64_t* game) {
     if (it == s.objects.end()) return false;
     *game = it->second;
     return true;
+}
+
+void gm_remove_owner(const void* owner) {
+    for (int i = 0; i < GM_SPACES; ++i) {
+        Space& s = g_spaces[i];
+        std::unique_lock<std::shared_mutex> lk(s.mu);
+        s.objects.erase(owner);
+        for (auto it = s.ranges.begin(); it != s.ranges.end();) {
+            if (it->second.owner == owner) it = s.ranges.erase(it);
+            else ++it;
+        }
+    }
 }
 
 uint64_t gm_translated_count() { return g_translated.load(); }

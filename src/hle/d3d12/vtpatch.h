@@ -51,3 +51,6 @@ void vt_override(void* obj, int slot, void* fn);
 
 // Original (unpatched) function for `slot` of a patched object.
 void* vt_original(void* obj, int slot);
+
+// True if obj's vptr is one of our patched tables (a live, title-facing object).
+bool vt_is_patched(const void* obj);

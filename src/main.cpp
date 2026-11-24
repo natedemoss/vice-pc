@@ -88,6 +88,20 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* ep) {
         ep->ContextRecord->Rip += 1;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+    if (code == EXCEPTION_SINGLE_STEP && (ep->ContextRecord->Dr6 & 0xF)) {
+        static std::atomic<int> hits{0};
+        if (hits.fetch_add(1) < 8) {
+            LOG("[watch] write to watched object (Dr6=0x%llx) at %s0x%llx", (unsigned long long)ep->ContextRecord->Dr6,
+                g_img.contains(ep->ExceptionRecord->ExceptionAddress) ? "game+" : "",
+                g_img.contains(ep->ExceptionRecord->ExceptionAddress)
+                    ? (unsigned long long)g_img.rva_of(ep->ExceptionRecord->ExceptionAddress)
+                    : (unsigned long long)ep->ExceptionRecord->ExceptionAddress);
+            print_backtrace(*ep->ContextRecord);
+            log_flush();
+        }
+        ep->ContextRecord->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     // Ignore C++ throws, debugger prints and thread naming: games use these normally.
     if (code == 0xE06D7363 || code == DBG_PRINTEXCEPTION_C || code == DBG_PRINTEXCEPTION_WIDE_C ||
         code == 0x406D1388 || code == DBG_CONTROL_C) {

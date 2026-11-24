@@ -32,5 +32,8 @@ uint64_t gm_translate(GmSpace space, uint64_t addr);
 void gm_set_object(GmSpace space, const void* obj, uint64_t game);
 bool gm_object(GmSpace space, const void* obj, uint64_t* game);
 
+// Forget every range and object entry belonging to `owner` (called when it is destroyed).
+void gm_remove_owner(const void* owner);
+
 // Counters for the log summary.
 uint64_t gm_translated_count();

@@ -55,21 +55,27 @@ uint8_t* alloc_code(size_t n) {
     return p;
 }
 
-// Swap rcx/rdx when called from game code, then tail-jump to `target`.
-void* make_sret_thunk(void* target) {
+// Struct return > 8 bytes. The title uses both conventions: C-interface calls pass the
+// hidden return pointer first (rcx) and `this` second; C++ calls pass `this` first.
+// From game code, swap rcx/rdx unless rcx already points at an object using `table`.
+void* make_sret_thunk(void* target, void** table) {
     uint64_t lo = reinterpret_cast<uint64_t>(hle_image_base());
     uint64_t hi = lo + hle_image_size();
-    uint8_t* c = alloc_code(64);
+    uint8_t* c = alloc_code(96);
     uint8_t* p = c;
     auto emit = [&](std::initializer_list<uint8_t> b) { for (auto x : b) *p++ = x; };
     auto imm64 = [&](uint64_t v) { memcpy(p, &v, 8); p += 8; };
     emit({0x48, 0x8B, 0x04, 0x24});           // mov rax, [rsp]   (return address)
     emit({0x49, 0xBA}); imm64(lo);            // mov r10, image_lo
     emit({0x4C, 0x39, 0xD0});                 // cmp rax, r10
-    emit({0x72, 0x12});                       // jb  native
+    emit({0x72, 0x24});                       // jb  native  (+36)
     emit({0x49, 0xBA}); imm64(hi);            // mov r10, image_hi
     emit({0x4C, 0x39, 0xD0});                 // cmp rax, r10
-    emit({0x73, 0x03});                       // jae native
+    emit({0x73, 0x15});                       // jae native  (+21)
+    emit({0x48, 0x8B, 0x01});                 // mov rax, [rcx]   (vptr if rcx is `this`)
+    emit({0x49, 0xBA}); imm64(reinterpret_cast<uint64_t>(table));  // mov r10, table
+    emit({0x4C, 0x39, 0xD0});                 // cmp rax, r10
+    emit({0x74, 0x03});                       // je  native (C++ call: already this-first)
     emit({0x48, 0x87, 0xCA});                 // xchg rdx, rcx
     emit({0x48, 0xB8}); imm64(reinterpret_cast<uint64_t>(target));  // native: mov rax, target
     emit({0xFF, 0xE0});                       // jmp rax
@@ -183,7 +189,7 @@ void* vt_patch(void* obj, const VtInterface& iface) {
         for (int i = 0; i < iface.pc_slots; ++i) p->table[i] = vt[i];
         int n_sret = 0, n_ret8 = 0;
         for (int s : iface.sret) {
-            if (s > 0 && s < iface.pc_slots) { p->table[s] = make_sret_thunk(vt[s]); ++n_sret; }
+            if (s > 0 && s < iface.pc_slots) { p->table[s] = make_sret_thunk(vt[s], p->table); ++n_sret; }
         }
         for (int s : iface.ret8) {
             if (s > 0 && s < iface.pc_slots) { p->table[s] = make_ret8_thunk(vt[s]); ++n_ret8; }
@@ -214,4 +220,13 @@ void* vt_original(void* obj, int slot) {
     Patched* p = lookup_obj(obj);
     if (p) return p->orig[slot];
     return (*static_cast<void***>(obj))[slot];
+}
+
+bool vt_is_patched(const void* obj) {
+    if (!obj) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(obj, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+    void** vt = *static_cast<void** const*>(obj);
+    std::lock_guard<std::mutex> lk(g_mu);
+    return by_table.count(vt) != 0;
 }

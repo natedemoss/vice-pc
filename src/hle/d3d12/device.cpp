@@ -335,6 +335,16 @@ void STDMETHODCALLTYPE Device_CreateSRVAtAddressX(ID3D12Device* self, const D3D1
         UINT el = d.Buffer.StructureByteStride ? d.Buffer.StructureByteStride
                   : (d.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 4 : element_bytes(d.Format);
         d.Buffer.FirstElement += byte_off / el;
+    } else if (ok && off == 0 && d.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+        res = static_cast<ID3D12Resource*>(owner);  // texture view on the texture created at that address
+        if (!vt_is_patched(res)) {
+            static std::atomic<int> bad{0};
+            if (bad.fetch_add(1) < 10)
+                LOG("[d3d12]   SRVAtAddressX: owner %p of va 0x%llx no longer looks like a resource (vptr %p)", res,
+                    (unsigned long long)x->gpu_va, *reinterpret_cast<void**>(res));
+            res = nullptr;
+        }
+        if (res && res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) res = nullptr;
     }
     if (g_srvx_logged.fetch_add(1) < 50)
         LOG("[d3d12] CreateSRVAtAddressX(va=0x%llx dim=%d fmt=%d n=%u width=%llu) -> %s", (unsigned long long)x->gpu_va,
@@ -361,8 +371,18 @@ UINT64 STDMETHODCALLTYPE Resource_GetGPUVirtualAddress(ID3D12Resource* self) {
     return orig<UINT64(STDMETHODCALLTYPE*)(ID3D12Resource*)>(self, 11)(self);
 }
 
+// ID3D12Resource slot 2: drop title address mappings when the resource dies.
+ULONG STDMETHODCALLTYPE Resource_Release(ID3D12Resource* self) {
+    uint64_t game;
+    bool mapped = gm_object(GM_GPU_VA, self, &game);
+    ULONG n = orig<ULONG(STDMETHODCALLTYPE*)(ID3D12Resource*)>(self, 2)(self);
+    if (n == 0 && mapped) gm_remove_owner(self);
+    return n;
+}
+
 void patch_resource(void* r) {
     vt_patch(r, kVtResource);
+    vt_override(r, 2, reinterpret_cast<void*>(&Resource_Release));
     vt_override(r, 11, reinterpret_cast<void*>(&Resource_GetGPUVirtualAddress));
 }
 
@@ -393,6 +413,13 @@ HRESULT STDMETHODCALLTYPE Device_CreateResourceAtAddressX(ID3D12Device* self, ui
                                                           const D3D12_CLEAR_VALUE* clear, REFIID, void** out) {
     D3D12_RESOURCE_DESC d = *xdesc;
     d.Flags &= static_cast<D3D12_RESOURCE_FLAGS>(0x3F);  // drop Xbox-only flags (e.g. 0x20000)
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        // Xbox alignment / layout values describe console tiling; let the PC driver choose.
+        d.Alignment = 0;
+        d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    }
+    // Clear values are only legal on render-target / depth-stencil resources.
+    if (!(d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) clear = nullptr;
     using Placed = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, ID3D12Heap*, UINT64, const D3D12_RESOURCE_DESC*,
                                                D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE*, REFIID, void**);
     using Committed = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_HEAP_PROPERTIES*, D3D12_HEAP_FLAGS,
@@ -425,7 +452,7 @@ HRESULT STDMETHODCALLTYPE Device_CreateResourceAtAddressX(ID3D12Device* self, ui
         delta = 0;
         D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
         hr = orig<Committed>(self, 27)(self, &hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_COMMON,
-                                       d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? nullptr : clear,
+                                       clear,
                                        __uuidof(ID3D12Resource), out);
         how = "GPU-only";
     }
@@ -436,6 +463,31 @@ HRESULT STDMETHODCALLTYPE Device_CreateResourceAtAddressX(ID3D12Device* self, ui
     auto* res = static_cast<ID3D12Resource*>(*out);
     patch_resource(res);
     uint64_t real = orig<UINT64(STDMETHODCALLTYPE*)(ID3D12Resource*)>(res, 11)(res) + delta;
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        // Textures: register the title address so views made from it find this resource.
+        D3D12_RESOURCE_ALLOCATION_INFO ai = self->GetResourceAllocationInfo(0, 1, &d);
+        gm_add_range(GM_GPU_VA, game_va, ai.SizeInBytes ? ai.SizeInBytes : 1, real, "texture", res);
+        // Diagnostic: hardware write-watch on the newest texture objects (VICEPC_WATCH=1).
+        {
+            static int slot = 0;
+            char w[4] = "";
+            if (GetEnvironmentVariableA("VICEPC_WATCH", w, sizeof(w)) && w[0] == '1') {
+                CONTEXT ctx{};
+                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                GetThreadContext(GetCurrentThread(), &ctx);
+                DWORD64* dr[4] = {&ctx.Dr0, &ctx.Dr1, &ctx.Dr2, &ctx.Dr3};
+                *dr[slot] = reinterpret_cast<DWORD64>(res);
+                ctx.Dr7 |= (1ull << (slot * 2));                    // local enable
+                ctx.Dr7 &= ~(0xFull << (16 + slot * 4));
+                ctx.Dr7 |= (0x1ull | (0x2ull << 2)) << (16 + slot * 4);  // write, 8 bytes
+                SetThreadContext(GetCurrentThread(), &ctx);
+                slot = (slot + 1) & 3;
+            }
+        }
+        static std::atomic<int> tex_logged{0};
+        if (tex_logged.fetch_add(1) < 400) LOG("[d3d12]   texture object %p at title 0x%llx", res, (unsigned long long)game_va);
+        gm_set_object(GM_GPU_VA, res, game_va);
+    }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
         gm_add_range(GM_GPU_VA, game_va, d.Width, real, "buffer", res);
         gm_set_object(GM_GPU_VA, res, game_va);
@@ -515,7 +567,35 @@ HRESULT STDMETHODCALLTYPE Device_CreateCommandSignature(ID3D12Device* self, cons
     using Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D12Device*, const D3D12_COMMAND_SIGNATURE_DESC*, ID3D12RootSignature*,
                                            REFIID, void**);
     HRESULT hr = orig<Fn>(self, 41)(self, desc, rs, __uuidof(ID3D12CommandSignature), out);
-    if (should_log(hr)) LOG("[d3d12] CreateCommandSignature(%u args) -> 0x%08lx", desc->NumArgumentDescs, hr);
+    char types[96] = "";
+    size_t len = 0;
+    for (UINT i = 0; i < desc->NumArgumentDescs && i < 12; ++i)
+        len += snprintf(types + len, sizeof(types) - len, "%d ", desc->pArgumentDescs[i].Type);
+    if (should_log(hr))
+        LOG("[d3d12] CreateCommandSignature(stride=%u, args: %s, rootsig=%p) -> 0x%08lx", desc->ByteStride, types, rs, hr);
+    if (FAILED(hr)) {
+        // Mesh-shader dispatch (and anything newer) isn't available on every PC GPU: keep an
+        // object of the same stride with a plain compute dispatch so the title's setup completes.
+        // Indirect calls through it are wrong until mesh shading is translated.
+        D3D12_INDIRECT_ARGUMENT_DESC args[16];
+        UINT n = desc->NumArgumentDescs < 16 ? desc->NumArgumentDescs : 16;
+        bool changed = false;
+        for (UINT i = 0; i < n; ++i) {
+            args[i] = desc->pArgumentDescs[i];
+            if (args[i].Type >= D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS) {
+                args[i].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+                changed = true;
+            }
+        }
+        if (changed) {
+            D3D12_COMMAND_SIGNATURE_DESC d = *desc;
+            d.pArgumentDescs = args;
+            d.NumArgumentDescs = n;
+            if (d.ByteStride < sizeof(D3D12_DISPATCH_ARGUMENTS)) d.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+            hr = orig<Fn>(self, 41)(self, &d, rs, __uuidof(ID3D12CommandSignature), out);
+            LOG("[d3d12]   retried with mesh/ray dispatch -> compute dispatch: 0x%08lx", hr);
+        }
+    }
     if (SUCCEEDED(hr)) vt_patch(*out, kVtCommandSignature);
     return hr;
 }

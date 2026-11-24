@@ -184,8 +184,12 @@ BOOL __cdecl XMemMapPhysicalPagesScatter_hle(const uint64_t* vas, uint64_t count
             ok = FALSE;
         }
     }
-    if (g_scatter_logged.fetch_add(1) < 16)
-        LOG("[xmem] XMemMapPhysicalPagesScatter(%u pages, %u mapped) -> %s", n, mapped, ok ? "ok" : "FAILED");
+    if (g_scatter_logged.fetch_add(1) < 16) {
+        uint64_t lo = ~0ull, hi = 0;
+        for (uint32_t i = 0; i < n; ++i) { lo = vas[i] < lo ? vas[i] : lo; hi = vas[i] > hi ? vas[i] : hi; }
+        LOG("[xmem] XMemMapPhysicalPagesScatter(%u pages at 0x%llx..0x%llx, %u mapped) -> %s", n,
+            (unsigned long long)lo, (unsigned long long)hi, mapped, ok ? "ok" : "FAILED");
+    }
     return ok;
 }
 
