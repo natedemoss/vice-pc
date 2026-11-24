@@ -28,15 +28,15 @@
   <text class="sub" x="28" y="63">Xbox Series title → Windows PC · reference target: package v1.0.2.1</text>
 
   <!-- Row 1: Loader -->
-  <circle class="dot-wip" cx="40" cy="102" r="12"/><text class="num" x="40" y="106" text-anchor="middle">1</text>
+  <circle class="done" cx="40" cy="102" r="12"/><text class="num" x="40" y="106" text-anchor="middle">✓</text>
   <text class="label" x="64" y="100">Loader</text>
-  <text class="desc" x="64" y="117">Map exe · link imports · TLS · unwind · crash log</text>
+  <text class="desc" x="64" y="117">Game code runs · first stop: D3D12ConfigureVirtualMemoryX</text>
   <rect class="track" x="380" y="96" width="400" height="12" rx="6"/>
-  <rect class="wip" x="380" y="96" width="343" height="12" rx="6"/>
-  <text class="pct" x="832" y="107" text-anchor="end">86%</text>
+  <rect class="done" x="380" y="96" width="400" height="12" rx="6"/>
+  <text class="pct" x="832" y="107" text-anchor="end">100%</text>
 
   <!-- Row 2: Boot -->
-  <circle class="dot-todo" cx="40" cy="152" r="12"/><text class="num" x="40" y="156" text-anchor="middle">2</text>
+  <circle class="dot-wip" cx="40" cy="152" r="12"/><text class="num" x="40" y="156" text-anchor="middle">2</text>
   <text class="label" x="64" y="150">Boot to main loop</text>
   <text class="desc" x="64" y="167">xmem (4/12) · RPF / TTPF files · DirectStorage</text>
   <rect class="track" x="380" y="146" width="400" height="12" rx="6"/>
